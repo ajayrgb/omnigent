@@ -1,0 +1,21 @@
+spec_version: 1
+name: example-agent
+description: A helpful AI assistant with Hindsight long-term memory.
+
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
+
+prompt: You are a helpful AI assistant.
+
+tools:
+  builtins:
+    - name: hindsight_recall
+      api_url: http://hindsight:8888
+
+    - name: hindsight_retain
+      api_url: http://hindsight:8888
+
+    - name: hindsight_reflect
+      api_url: http://hindsight:8888

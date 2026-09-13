@@ -53,6 +53,7 @@ services:
       dockerfile: deploy/docker/Dockerfile
       args:
         PYPI_INDEX_URL: ${PYPI_INDEX_URL:-https://pypi.org/simple}
+        OMNIGENT_EXTRAS: memory
     restart: unless-stopped
     depends_on:
       postgres:
@@ -95,6 +96,12 @@ services:
       #   "header"   — read X-Forwarded-Email from a trusted proxy;
       #                requests missing the header are rejected (401)
       OMNIGENT_AUTH_PROVIDER: "${OMNIGENT_AUTH_PROVIDER:-}"
+      # Comma-separated origins trusted for CSRF-sensitive endpoints
+      # (multipart uploads, WebSocket handshakes). Required whenever the
+      # UI is reached by anything other than localhost/127.0.0.1 (LAN IP,
+      # hostname, remote box) — those origins aren't auto-trusted.
+      # Example: http://192.168.1.50:8000,http://my-host:8000
+      OMNIGENT_WS_ALLOWED_ORIGINS: "${OMNIGENT_WS_ALLOWED_ORIGINS:-}"
 
       # OIDC config — consumed when OIDC mode is active (AUTH_ENABLED=1
       # with OMNIGENT_OIDC_ISSUER set, or AUTH_PROVIDER=oidc). Required
@@ -150,10 +157,57 @@ services:
       # can't click.
       OMNIGENT_ACCOUNTS_AUTO_OPEN: "${OMNIGENT_ACCOUNTS_AUTO_OPEN:-0}"
     volumes:
-      - artifact-data:/data
+      - ./data:/data
     ports:
       - "${OMNIGENT_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/v1/info || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  runner1:
+    image: ${OMNIGENT_IMAGE:-ghcr.io/omnigent-ai/omnigent-host}:${OMNIGENT_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      omnigent:
+        condition: service_healthy
+    environment:
+      OMNIGENT_SERVER: http://omnigent:8000
+    volumes:
+      - ./agents:/agents
+      - ~/.claude/.credentials.json:/root/.claude/.credentials.json:ro
+    command: omnigent host --server http://omnigent:8000
+
+  hindsight:
+    # Memory server — https://hindsight.vectorize.io/developer/installation#docker
+    image: ghcr.io/vectorize-io/hindsight:latest
+    restart: unless-stopped
+    shm_size: 1g
+    environment:
+      HINDSIGHT_API_LLM_PROVIDER: "${HINDSIGHT_API_LLM_PROVIDER:-openai}"
+      HINDSIGHT_API_LLM_API_KEY: "${HINDSIGHT_API_LLM_API_KEY:?set HINDSIGHT_API_LLM_API_KEY in .env}"
+    volumes:
+      - hindsight-data:/home/hindsight/.pg0
+    ports:
+      - "${HINDSIGHT_API_PORT:-8888}:8888"
+      - "${HINDSIGHT_CONTROL_PORT:-9999}:9999"
+
+  runner2:
+    image: ${OMNIGENT_IMAGE:-ghcr.io/omnigent-ai/omnigent-host}:${OMNIGENT_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      omnigent:
+        condition: service_healthy
+    environment:
+      OMNIGENT_SERVER: http://omnigent:8000
+    volumes:
+      - ./agents:/agents
+      - ~/.claude/.credentials.json:/root/.claude/.credentials.json:ro
+    command: omnigent run /agents/agent --server http://omnigent:8000
+
+
 
 volumes:
   postgres-data:
-  artifact-data:
+  hindsight-data:

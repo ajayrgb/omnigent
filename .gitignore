@@ -63,6 +63,10 @@ run-omnigents.sh
 artifacts/
 .tmp-codex-parity-target/
 
+# Bind-mounted server data volume from `docker compose up` in deploy/docker
+# (docker-compose.yaml mounts ./data:/data) — local runtime state, not source.
+deploy/docker/data/
+
 # omnidev (dev pod supervisor) Rust build output. Pod state lives outside the
 # repo under ~/.cache/omnidev/, so only the build dir needs ignoring.
 dev/omnidev/target/
