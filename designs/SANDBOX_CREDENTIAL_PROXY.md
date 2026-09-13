@@ -262,7 +262,7 @@ uploads need no special-casing and share the exact same resign code path.
 Only presigned query-string auth (`?X-Amz-Signature=...`, a different
 signing mode not produced by ordinary `boto3` API calls) is out of scope.
 
-**Two credential shapes**, mutually exclusive:
+**Three credential shapes**, mutually exclusive:
 
 ```yaml
 os_env:
@@ -285,11 +285,26 @@ os_env:
           secret_access_key: {env: AWS_SECRET_ACCESS_KEY}
           # session_token: {env: AWS_SESSION_TOKEN}   # optional
 
+      # profile — the parent resolves the full credential from a named
+      # profile in its own ~/.aws/config / ~/.aws/credentials, via boto3's
+      # Session(profile_name=...). One shared credentials file with many
+      # profiles (e.g. "prod", "staging") can back different aws_sigv4
+      # entries this way, including a profile that itself role-chains via
+      # source_profile or uses SSO — boto3 resolves and refreshes all of
+      # that, not omnigent.
+      - type: aws_sigv4
+        target: staging-bucket.s3.us-east-1.amazonaws.com
+        region: us-east-1
+        credential:
+          profile: staging
+
       # assume_role (recommended) — the parent mints and auto-refreshes
-      # temporary credentials via STS, using its OWN ambient AWS identity
-      # (env/config/instance-profile/SSO — whatever the omnigent server
-      # itself runs as). No long-lived IAM user key needs to be handed to
-      # omnigent when the server already has a role that can assume one.
+      # temporary credentials via an explicit STS call, using its OWN
+      # ambient AWS identity (env/config/instance-profile/SSO — whatever
+      # the omnigent server itself runs as, or a specific named `profile`
+      # below) as the caller. No long-lived IAM user key needs to be
+      # handed to omnigent when the server already has a role that can
+      # assume one.
       - type: aws_sigv4
         target: otherbucket.s3.us-west-2.amazonaws.com
         region: us-west-2
@@ -297,6 +312,7 @@ os_env:
           assume_role:
             role_arn: arn:aws:iam::123456789012:role/omnigent-agent-s3
             duration_seconds: 3600
+            # profile: prod                           # optional caller identity
 ```
 
 `region`/`service` are declared explicitly per binding, matching every
@@ -330,11 +346,13 @@ a `SignatureDoesNotMatch` from AWS — never a credential leak.
 - `DatabricksProxySpec` / `DatabricksProfileBinding` — the profile list
   (+ `default`, `config_env`) for the `databricks_cli` type.
 - `AwsAssumeRoleSpec` — STS `AssumeRole` parameters (`role_arn`,
-  `session_name`, `duration_seconds`, `external_id`) for a refreshing
-  `aws_sigv4` credential.
-- `AwsSigV4CredentialSpec` — either a static 3-part credential
+  `session_name`, `duration_seconds`, `external_id`, optional `profile`
+  for the caller identity) for a refreshing `aws_sigv4` credential.
+- `AwsSigV4CredentialSpec` — exactly one of: a static 3-part credential
   (`access_key_id` / `secret_access_key` / optional `session_token`, each
-  a `CredentialSourceSpec`) or `assume_role`, mutually exclusive.
+  a `CredentialSourceSpec`), `profile` (a named AWS profile resolved via
+  `boto3.Session(profile_name=...)`), or `assume_role` — mutually
+  exclusive.
 - `AwsSigV4ProxyEntry` — the host-keyed `aws_sigv4` binding: `host`,
   `region`, `service`, `credential`. Carried on `CredentialProxySpec.
   aws_sigv4` — a separate list from `entries`, since the proxy enforces it
@@ -391,10 +409,14 @@ AwsSigV4RewriteRule]`. Each rule carries either a static
 `AwsSigV4Credentials` (access key id + secret key + optional session
 token) or a refreshing `credential_provider` — `AwsSigV4CredentialProvider`
 for the `assume_role` shape, which mints temporary credentials via STS
-using the *parent's own ambient AWS identity* and re-mints when the cached
-credential is within a safety margin of its STS-declared `Expiration`
-(an explicit, authoritative expiry, unlike Databricks' opaque OAuth token —
-so no blind fixed-interval throttle is needed). Whenever `spec.aws_sigv4`
+using the *parent's own ambient AWS identity* (or a named `profile`, when
+set) and re-mints when the cached credential is within a safety margin of
+its STS-declared `Expiration` (an explicit, authoritative expiry, unlike
+Databricks' opaque OAuth token — so no blind fixed-interval throttle is
+needed); or `AwsSigV4ProfileCredentialProvider` for the `profile` shape,
+which re-freezes `boto3.Session(profile_name=...).get_credentials()` on
+every call instead of tracking its own expiry — boto3 already refreshes a
+role-chained or SSO profile internally. Whenever `spec.aws_sigv4`
 is non-empty, placeholder `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
 `AWS_DEFAULT_REGION` / `AWS_REGION` / `AWS_EC2_METADATA_DISABLED` are
 always added to `helper_env_updates` (not opt-in, unlike `inject_env`) —

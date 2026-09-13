@@ -466,38 +466,55 @@ class AwsAssumeRoleSpec:
         synthesizes one (e.g. ``"omnigent-sandbox"``).
     :param duration_seconds: Requested credential lifetime.
     :param external_id: Optional ``ExternalId`` for a third-party role.
+    :param profile: Named profile in the parent's shared AWS config/
+        credentials files (``~/.aws/config``, ``~/.aws/credentials``) to use
+        as the caller identity for the STS ``AssumeRole`` call, e.g.
+        ``"prod"``. ``None`` uses boto3's default credential chain (plain
+        env vars, the profile named by ``AWS_PROFILE``, container/instance
+        role, or SSO) instead of a specific named profile.
     """
 
     role_arn: str
     session_name: str | None = None
     duration_seconds: int = 3600
     external_id: str | None = None
+    profile: str | None = None
 
 
 @dataclass
 class AwsSigV4CredentialSpec:
     """Where the parent resolves the ``aws_sigv4`` credential from.
 
-    Exactly one of two shapes: a static 3-part credential (each part
+    Exactly one of three shapes: a static 3-part credential (each part
     resolved via the existing ``{env|file|command}`` source model, for an
-    externally rotated key or a pre-minted session token), or
+    externally rotated key or a pre-minted session token), :attr:`profile`
+    (the parent resolves whatever boto3 finds for that named profile in
+    ``~/.aws/config`` / ``~/.aws/credentials``, including a profile that
+    itself chains through ``source_profile`` role assumption or SSO), or
     :attr:`assume_role` (the parent mints and auto-refreshes temporary
-    credentials via STS).
+    credentials via an explicit STS call).
 
-    :param access_key_id: Static access key id source. ``None`` when
-        using :attr:`assume_role`.
-    :param secret_access_key: Static secret key source. ``None`` when
-        using :attr:`assume_role`.
+    :param access_key_id: Static access key id source. ``None`` when using
+        :attr:`profile` or :attr:`assume_role`.
+    :param secret_access_key: Static secret key source. ``None`` when using
+        :attr:`profile` or :attr:`assume_role`.
     :param session_token: Optional static session-token source (for an
         externally pre-minted temporary credential). Never set together
-        with :attr:`assume_role`, which mints its own.
+        with :attr:`profile` or :attr:`assume_role`, which resolve their
+        own.
+    :param profile: Named profile in the parent's shared AWS config/
+        credentials files to resolve the full credential from, e.g.
+        ``"prod"``. Lets one ``~/.aws/credentials`` with multiple profiles
+        back different ``aws_sigv4`` host entries. ``None`` when using a
+        static credential or :attr:`assume_role`.
     :param assume_role: STS ``AssumeRole`` parameters. ``None`` when using
-        a static credential.
+        a static credential or :attr:`profile`.
     """
 
     access_key_id: CredentialSourceSpec | None = None
     secret_access_key: CredentialSourceSpec | None = None
     session_token: CredentialSourceSpec | None = None
+    profile: str | None = None
     assume_role: AwsAssumeRoleSpec | None = None
 
 
