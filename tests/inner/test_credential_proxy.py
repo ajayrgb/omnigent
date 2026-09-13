@@ -21,6 +21,7 @@ from omnigent.errors import OmnigentError
 from omnigent.inner.credential_proxy import (
     SYNTHETIC_CREDENTIAL_PREFIX,
     AwsSigV4CredentialProvider,
+    AwsSigV4ProfileCredentialProvider,
     CredentialProxyRuntime,
     DatabricksProfileTokenProvider,
     _prepare_aws_sigv4_rewrite,
@@ -592,3 +593,106 @@ def test_prepare_aws_sigv4_rewrite_static_and_assume_role() -> None:
     rule2 = _prepare_aws_sigv4_rewrite(assume_role_entry, parent_env={}, provider_factory=factory)
     assert rule2.credential_provider is not None
     assert rule2.resolve_credentials().session_token == "tok"
+
+
+class _FakeFrozenCredentials:
+    """Stand-in for ``botocore.credentials.ReadOnlyCredentials``."""
+
+    def __init__(self, access_key: str, secret_key: str, token: str | None) -> None:
+        self.access_key = access_key
+        self.secret_key = secret_key
+        self.token = token
+
+
+class _FakeProfileCredentials:
+    """Stand-in for a ``boto3.Session(profile_name=...).get_credentials()``
+    result: ``get_frozen_credentials()`` re-reads current state each call,
+    the same way boto3's real object refreshes SSO/role-chained profiles."""
+
+    def __init__(self, access_key: str, secret_key: str, token: str | None = None) -> None:
+        self._access_key = access_key
+        self._secret_key = secret_key
+        self._token = token
+
+    def get_frozen_credentials(self) -> _FakeFrozenCredentials:
+        return _FakeFrozenCredentials(self._access_key, self._secret_key, self._token)
+
+
+def test_aws_sigv4_profile_credential_provider_resolves() -> None:
+    """The profile provider re-freezes the boto3 credentials object on
+    every ``resolve()``, matching a profile that role-chains or uses SSO."""
+    fake = _FakeProfileCredentials("AKIAPROFILE", "sek", "tok")
+    provider = AwsSigV4ProfileCredentialProvider("prod", credentials_factory=lambda _p: fake)
+    creds = provider.resolve()
+    assert creds.access_key_id == "AKIAPROFILE"
+    assert creds.secret_access_key == "sek"
+    assert creds.session_token == "tok"
+
+
+def test_aws_sigv4_profile_credential_provider_rejects_incomplete_credential() -> None:
+    """A profile that resolves to an empty secret key fails loud."""
+    fake = _FakeProfileCredentials("AKIAPROFILE", "")
+    provider = AwsSigV4ProfileCredentialProvider("prod", credentials_factory=lambda _p: fake)
+    with pytest.raises(OmnigentError, match="incomplete credential"):
+        provider.resolve()
+
+
+def test_aws_sigv4_profile_credential_provider_missing_boto3_fails_loud(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default profile-credentials factory fails loud when boto3 is
+    absent, at construction time rather than on first ``resolve()``."""
+    monkeypatch.setitem(sys.modules, "boto3", None)
+    with pytest.raises(OmnigentError, match="requires 'boto3'"):
+        AwsSigV4ProfileCredentialProvider("prod")
+
+
+def test_aws_sigv4_profile_credential_provider_missing_profile_fails_loud() -> None:
+    """A profile with no resolvable credentials fails loud at construction."""
+    with pytest.raises(OmnigentError, match="resolved no credentials"):
+        AwsSigV4ProfileCredentialProvider("prod", credentials_factory=lambda _p: None)
+
+
+def test_prepare_aws_sigv4_rewrite_profile() -> None:
+    """The runtime helper dispatches on entry.credential.profile, letting
+    one ``~/.aws/credentials`` with multiple named profiles back different
+    ``aws_sigv4`` host entries."""
+    fake = _FakeProfileCredentials("AKIAPROFILE", "sek")
+
+    def profile_factory(profile: str) -> AwsSigV4ProfileCredentialProvider:
+        assert profile == "prod"
+        return AwsSigV4ProfileCredentialProvider("prod", credentials_factory=lambda _p: fake)
+
+    entry = AwsSigV4ProxyEntry(
+        host="d.s3.us-east-1.amazonaws.com",
+        region="us-east-1",
+        credential=AwsSigV4CredentialSpec(profile="prod"),
+    )
+    rule = _prepare_aws_sigv4_rewrite(
+        entry, parent_env={}, profile_provider_factory=profile_factory
+    )
+    assert rule.static_credentials is None
+    assert rule.credential_provider is not None
+    assert rule.resolve_credentials().access_key_id == "AKIAPROFILE"
+
+
+def test_prepare_aws_sigv4_rewrite_assume_role_passes_profile_through() -> None:
+    """``assume_role.profile`` reaches the provider factory as the caller
+    identity for the STS call, distinct from ``credential.profile``."""
+    seen: dict[str, object] = {}
+
+    def factory(role_arn: str, **kwargs: object) -> AwsSigV4CredentialProvider:
+        seen.update(kwargs)
+        return AwsSigV4CredentialProvider(
+            role_arn, sts_client_factory=lambda: _FakeStsClient(["tok"]), **kwargs
+        )
+
+    entry = AwsSigV4ProxyEntry(
+        host="e.s3.us-east-1.amazonaws.com",
+        region="us-east-1",
+        credential=AwsSigV4CredentialSpec(
+            assume_role=AwsAssumeRoleSpec(role_arn="arn:aws:iam::123:role/x", profile="prod")
+        ),
+    )
+    _prepare_aws_sigv4_rewrite(entry, parent_env={}, provider_factory=factory)
+    assert seen["profile"] == "prod"

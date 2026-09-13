@@ -4304,6 +4304,47 @@ def test_parse_credential_proxy_aws_sigv4_assume_role(tmp_path: Path) -> None:
     assert entry.credential.assume_role.duration_seconds == 900
 
 
+def test_parse_credential_proxy_aws_sigv4_assume_role_with_profile(tmp_path: Path) -> None:
+    """An ``assume_role`` credential can name a base-identity profile."""
+    config = _aws_sigv4_config(
+        {
+            "type": "aws_sigv4",
+            "target": "mybucket.s3.us-east-1.amazonaws.com",
+            "region": "us-east-1",
+            "credential": {
+                "assume_role": {
+                    "role_arn": "arn:aws:iam::123456789012:role/omnigent-agent-s3",
+                    "profile": "prod",
+                }
+            },
+        }
+    )
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    entry = spec.os_env.sandbox.credential_proxy.aws_sigv4[0]
+    assert entry.credential.assume_role.profile == "prod"
+
+
+def test_parse_credential_proxy_aws_sigv4_profile(tmp_path: Path) -> None:
+    """A ``profile`` credential round-trips onto ``AwsSigV4CredentialSpec``,
+    letting a multi-profile ``~/.aws/credentials`` back this entry without
+    naming ``access_key_id``/``secret_access_key`` sources at all."""
+    config = _aws_sigv4_config(
+        {
+            "type": "aws_sigv4",
+            "target": "mybucket.s3.us-east-1.amazonaws.com",
+            "region": "us-east-1",
+            "credential": {"profile": "prod"},
+        }
+    )
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    entry = spec.os_env.sandbox.credential_proxy.aws_sigv4[0]
+    assert entry.credential.profile == "prod"
+    assert entry.credential.access_key_id is None
+    assert entry.credential.assume_role is None
+
+
 def test_parse_credential_proxy_aws_sigv4_default_service_is_s3(tmp_path: Path) -> None:
     config = _aws_sigv4_config(
         {
@@ -4422,7 +4463,41 @@ def test_parse_credential_proxy_aws_sigv4_allowed_on_macos(tmp_path: Path) -> No
                     "secret_access_key": {"env": "B"},
                 },
             },
-            r"either 'assume_role' or",
+            r"exactly one of 'assume_role', 'profile', or",
+        ),
+        (
+            {
+                "type": "aws_sigv4",
+                "target": "mybucket.s3.us-east-1.amazonaws.com",
+                "region": "us-east-1",
+                "credential": {
+                    "profile": "prod",
+                    "access_key_id": {"env": "A"},
+                    "secret_access_key": {"env": "B"},
+                },
+            },
+            r"exactly one of 'assume_role', 'profile', or",
+        ),
+        (
+            {
+                "type": "aws_sigv4",
+                "target": "mybucket.s3.us-east-1.amazonaws.com",
+                "region": "us-east-1",
+                "credential": {
+                    "profile": "prod",
+                    "assume_role": {"role_arn": "arn:aws:iam::123:role/x"},
+                },
+            },
+            r"exactly one of 'assume_role', 'profile', or",
+        ),
+        (
+            {
+                "type": "aws_sigv4",
+                "target": "mybucket.s3.us-east-1.amazonaws.com",
+                "region": "us-east-1",
+                "credential": {"profile": "  "},
+            },
+            r"'profile' must be a non-empty string",
         ),
     ],
 )

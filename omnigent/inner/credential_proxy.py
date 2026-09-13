@@ -735,10 +735,13 @@ _DEFAULT_ASSUME_ROLE_SESSION_NAME = "omnigent-sandbox"
 _DEFAULT_ASSUME_ROLE_REFRESH_MARGIN_SECONDS = 300.0
 
 
-def _default_sts_client() -> object:
+def _default_sts_client(profile: str | None = None) -> object:
     """
     Build a ``boto3`` STS client from the parent's ambient AWS identity.
 
+    :param profile: Named AWS profile to use as the caller identity
+        (``boto3.Session(profile_name=profile)``). ``None`` uses boto3's
+        default credential chain.
     :returns: A ``boto3`` STS client.
     :raises OmnigentError: If ``boto3`` is not installed.
     """
@@ -751,7 +754,37 @@ def _default_sts_client() -> object:
             "`pip install omnigent[s3]`).",
             code=ErrorCode.INVALID_INPUT,
         ) from exc
+    if profile is not None:
+        return boto3.Session(profile_name=profile).client("sts")
     return boto3.client("sts")
+
+
+def _default_profile_credentials(profile: str) -> object:
+    """
+    Build a ``boto3`` credentials object for a named AWS profile.
+
+    Delegates entirely to ``boto3.Session(profile_name=...)``, which
+    already resolves static keys, ``source_profile`` role chaining, and
+    SSO tokens from ``~/.aws/config`` / ``~/.aws/credentials`` -- and keeps
+    the returned object's own refresh behavior, so callers just re-freeze
+    it on each use instead of reimplementing that logic.
+
+    :param profile: The named profile to resolve.
+    :returns: A ``boto3`` credentials object (``get_frozen_credentials()``
+        returns the live access key / secret key / token), or ``None`` if
+        the profile resolves no credentials -- checked by the caller.
+    :raises OmnigentError: If ``boto3`` is not installed.
+    """
+    try:
+        import boto3
+    except ImportError as exc:
+        raise OmnigentError(
+            "os_env.sandbox.credential_proxy type 'aws_sigv4' with a "
+            "'profile' credential requires 'boto3'. Install the 's3' "
+            "extra (e.g. `pip install omnigent[s3]`).",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
+    return boto3.Session(profile_name=profile).get_credentials()
 
 
 class AwsSigV4CredentialProvider:
@@ -778,6 +811,7 @@ class AwsSigV4CredentialProvider:
         session_name: str | None = None,
         duration_seconds: int = 3600,
         external_id: str | None = None,
+        profile: str | None = None,
         refresh_margin_seconds: float = _DEFAULT_ASSUME_ROLE_REFRESH_MARGIN_SECONDS,
         sts_client_factory: Callable[[], object] | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -790,10 +824,15 @@ class AwsSigV4CredentialProvider:
             uses :data:`_DEFAULT_ASSUME_ROLE_SESSION_NAME`.
         :param duration_seconds: Requested credential lifetime.
         :param external_id: Optional ``ExternalId`` for a third-party role.
+        :param profile: Named AWS profile to use as the caller identity for
+            the ``AssumeRole`` call. ``None`` uses boto3's default
+            credential chain. Ignored when ``sts_client_factory`` is set.
         :param refresh_margin_seconds: Re-mint this many seconds before
             the STS-declared expiry.
         :param sts_client_factory: Test seam building the STS client
-            (defaults to a real ``boto3.client("sts")``).
+            (defaults to a real ``boto3.client("sts")``, or
+            ``boto3.Session(profile_name=profile).client("sts")`` when
+            *profile* is set).
         :param clock: Monotonic clock, injectable for tests.
         """
         self.role_arn = role_arn
@@ -801,7 +840,7 @@ class AwsSigV4CredentialProvider:
         self._duration_seconds = duration_seconds
         self._external_id = external_id
         self._refresh_margin_seconds = refresh_margin_seconds
-        self._sts_client_factory = sts_client_factory or _default_sts_client
+        self._sts_client_factory = sts_client_factory or (lambda: _default_sts_client(profile))
         self._clock = clock
         self._lock = threading.Lock()
         self._credentials: AwsSigV4Credentials | None = None
@@ -858,11 +897,74 @@ class AwsSigV4CredentialProvider:
             return self._credentials
 
 
+class AwsSigV4ProfileCredentialProvider:
+    """:class:`AwsSigV4Credentials` source bound to a named AWS profile.
+
+    Delegates entirely to boto3's own
+    ``Session(profile_name=...).get_credentials()``, which already handles
+    static keys, ``source_profile`` role chaining, and SSO token refresh
+    for a profile in ``~/.aws/config`` / ``~/.aws/credentials`` -- this
+    class just re-freezes the credentials on every :meth:`resolve` call
+    rather than reimplementing that refresh logic itself.
+    """
+
+    def __init__(
+        self,
+        profile: str,
+        *,
+        credentials_factory: Callable[[str], object] | None = None,
+    ) -> None:
+        """
+        Build a provider for *profile* and resolve it once, eagerly.
+
+        Resolving eagerly (rather than on first :meth:`resolve`) surfaces a
+        missing or misconfigured profile at proxy-setup time instead of on
+        the first sandboxed request.
+
+        :param profile: The named AWS profile to resolve.
+        :param credentials_factory: Test seam building the boto3
+            credentials object (defaults to a real
+            ``boto3.Session(profile_name=profile).get_credentials()``).
+        :raises OmnigentError: If ``boto3`` is not installed, or the
+            profile resolves no credentials.
+        """
+        self.profile = profile
+        factory = credentials_factory or _default_profile_credentials
+        credentials = factory(profile)
+        if credentials is None:
+            raise OmnigentError(
+                f"AWS profile {profile!r} resolved no credentials (check "
+                "~/.aws/credentials and ~/.aws/config).",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        self._credentials = credentials
+
+    def resolve(self) -> AwsSigV4Credentials:
+        """
+        Return the current credential, re-frozen from the boto3 profile.
+
+        :returns: A live credential for :attr:`profile`.
+        :raises OmnigentError: If the profile's credentials are incomplete.
+        """
+        frozen = self._credentials.get_frozen_credentials()  # type: ignore[attr-defined]
+        if not frozen.access_key or not frozen.secret_key:
+            raise OmnigentError(
+                f"AWS profile {self.profile!r} produced an incomplete credential.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        return AwsSigV4Credentials(
+            access_key_id=frozen.access_key,
+            secret_access_key=frozen.secret_key,
+            session_token=frozen.token,
+        )
+
+
 def _prepare_aws_sigv4_rewrite(
     entry: AwsSigV4ProxyEntry,
     *,
     parent_env: dict[str, str],
     provider_factory: Callable[..., AwsSigV4CredentialProvider] | None = None,
+    profile_provider_factory: Callable[[str], AwsSigV4ProfileCredentialProvider] | None = None,
 ) -> AwsSigV4RewriteRule:
     """
     Resolve one ``aws_sigv4`` entry into a proxy rewrite rule.
@@ -873,8 +975,11 @@ def _prepare_aws_sigv4_rewrite(
 
     :param entry: The parsed entry (host, region, service, credential).
     :param parent_env: Parent process environment for ``env`` sources.
-    :param provider_factory: Test seam building the refreshing provider.
-    :returns: A rule with either a static credential or a refreshing
+    :param provider_factory: Test seam building the refreshing
+        ``assume_role`` provider.
+    :param profile_provider_factory: Test seam building the refreshing
+        ``profile`` provider.
+    :returns: A rule with a static credential, or a refreshing
         ``credential_provider``, depending on :attr:`entry.credential`.
     :raises ValueError: If a static source cannot be resolved.
     """
@@ -886,12 +991,22 @@ def _prepare_aws_sigv4_rewrite(
             session_name=assume_role.session_name,
             duration_seconds=assume_role.duration_seconds,
             external_id=assume_role.external_id,
+            profile=assume_role.profile,
         )
         return AwsSigV4RewriteRule(
             host=entry.host,
             region=entry.region,
             service=entry.service,
             credential_provider=provider.resolve,
+        )
+    if entry.credential.profile is not None:
+        profile_factory = profile_provider_factory or AwsSigV4ProfileCredentialProvider
+        profile_provider = profile_factory(entry.credential.profile)
+        return AwsSigV4RewriteRule(
+            host=entry.host,
+            region=entry.region,
+            service=entry.service,
+            credential_provider=profile_provider.resolve,
         )
     assert entry.credential.access_key_id is not None
     assert entry.credential.secret_access_key is not None
@@ -918,6 +1033,7 @@ __all__ = [
     "SYNTHETIC_CREDENTIAL_PREFIX",
     "AwsSigV4CredentialProvider",
     "AwsSigV4Credentials",
+    "AwsSigV4ProfileCredentialProvider",
     "AwsSigV4RewriteRule",
     "CredentialProxyRuntime",
     "CredentialRewriteRule",

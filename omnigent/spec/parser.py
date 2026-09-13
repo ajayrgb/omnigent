@@ -1471,6 +1471,9 @@ class _AwsAssumeRoleModel(BaseModel):  # type: ignore[explicit-any]
     :param session_name: Optional ``RoleSessionName``.
     :param duration_seconds: Requested credential lifetime.
     :param external_id: Optional ``ExternalId`` for a third-party role.
+    :param profile: Optional named AWS profile to use as the caller
+        identity for the ``AssumeRole`` call, instead of boto3's default
+        credential chain.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -1479,6 +1482,7 @@ class _AwsAssumeRoleModel(BaseModel):  # type: ignore[explicit-any]
     session_name: str | None = None
     duration_seconds: int = 3600
     external_id: str | None = None
+    profile: str | None = None
 
     @field_validator("role_arn")
     @classmethod
@@ -1494,26 +1498,37 @@ class _AwsAssumeRoleModel(BaseModel):  # type: ignore[explicit-any]
             raise ValueError("assume_role 'duration_seconds' must be positive")
         return value
 
+    @field_validator("profile")
+    @classmethod
+    def _profile_nonempty(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("assume_role 'profile' must be a non-empty string")
+        return value
+
     def to_spec(self) -> AwsAssumeRoleSpec:
         return AwsAssumeRoleSpec(
             role_arn=self.role_arn,
             session_name=self.session_name,
             duration_seconds=self.duration_seconds,
             external_id=self.external_id,
+            profile=self.profile,
         )
 
 
 class _AwsSigV4CredentialModel(BaseModel):  # type: ignore[explicit-any]
     """Pydantic boundary model for ``aws_sigv4[*].credential``.
 
-    Exactly one of two shapes: a static 3-part credential
+    Exactly one of three shapes: a static 3-part credential
     (``access_key_id`` + ``secret_access_key`` + optional
-    ``session_token``), or ``assume_role`` (the parent mints and
-    auto-refreshes temporary credentials via STS).
+    ``session_token``), ``profile`` (the parent resolves the full
+    credential from a named profile in its shared AWS config/credentials
+    files), or ``assume_role`` (the parent mints and auto-refreshes
+    temporary credentials via an explicit STS call).
 
     :param access_key_id: Static access key id source.
     :param secret_access_key: Static secret key source.
     :param session_token: Optional static session-token source.
+    :param profile: Named AWS profile to resolve the full credential from.
     :param assume_role: STS ``AssumeRole`` parameters.
     """
 
@@ -1522,35 +1537,50 @@ class _AwsSigV4CredentialModel(BaseModel):  # type: ignore[explicit-any]
     access_key_id: _CredentialSourceModel | None = None
     secret_access_key: _CredentialSourceModel | None = None
     session_token: _CredentialSourceModel | None = None
+    profile: str | None = None
     assume_role: _AwsAssumeRoleModel | None = None
+
+    @field_validator("profile")
+    @classmethod
+    def _profile_nonempty(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("credential 'profile' must be a non-empty string")
+        return value
 
     @model_validator(mode="after")
     def _check_shape(self) -> _AwsSigV4CredentialModel:
         """
-        Enforce the static-vs-assume_role exclusivity.
+        Enforce static-vs-profile-vs-assume_role exclusivity.
 
         :returns: ``self`` once validated.
-        :raises ValueError: If both shapes (or neither) are set, or if a
-            static credential is missing a required part.
+        :raises ValueError: If more than one shape (or none) is set, or if
+            a static credential is missing a required part.
         """
         has_static = self.access_key_id is not None or self.secret_access_key is not None
-        if self.assume_role is not None:
-            if has_static or self.session_token is not None:
-                raise ValueError(
-                    "credential accepts either 'assume_role' or "
-                    "'access_key_id'/'secret_access_key'/'session_token', not both"
-                )
+        has_profile = self.profile is not None
+        has_assume_role = self.assume_role is not None
+        shape_count = sum(
+            [has_static or self.session_token is not None, has_profile, has_assume_role]
+        )
+        if shape_count > 1:
+            raise ValueError(
+                "credential accepts exactly one of 'assume_role', 'profile', or "
+                "'access_key_id'/'secret_access_key'/'session_token', not more than one"
+            )
+        if has_assume_role or has_profile:
             return self
         if self.access_key_id is None or self.secret_access_key is None:
             raise ValueError(
                 "credential requires both 'access_key_id' and 'secret_access_key' "
-                "when 'assume_role' is not set"
+                "when 'assume_role' and 'profile' are not set"
             )
         return self
 
     def to_spec(self) -> AwsSigV4CredentialSpec:
         if self.assume_role is not None:
             return AwsSigV4CredentialSpec(assume_role=self.assume_role.to_spec())
+        if self.profile is not None:
+            return AwsSigV4CredentialSpec(profile=self.profile)
         assert self.access_key_id is not None and self.secret_access_key is not None
         return AwsSigV4CredentialSpec(
             access_key_id=self.access_key_id.to_spec(),
