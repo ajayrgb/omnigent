@@ -452,6 +452,84 @@ class CredentialProxyEntry:
 
 
 @dataclass
+class AwsAssumeRoleSpec:
+    """STS ``AssumeRole`` parameters for a refreshing ``aws_sigv4`` credential.
+
+    Resolved by the parent process using its own ambient AWS identity
+    (env vars, shared config/credentials file, container/instance role,
+    SSO — whatever boto3's default credential chain finds for the
+    omnigent server itself). The sandbox never sees that identity, nor
+    the role's temporary credentials directly.
+
+    :param role_arn: ARN of the role to assume, e.g.
+        ``"arn:aws:iam::123456789012:role/omnigent-agent-s3"``.
+    :param session_name: ``RoleSessionName`` for the STS call. ``None``
+        synthesizes one (e.g. ``"omnigent-sandbox"``).
+    :param duration_seconds: Requested credential lifetime.
+    :param external_id: Optional ``ExternalId`` for a third-party role.
+    """
+
+    role_arn: str
+    session_name: str | None = None
+    duration_seconds: int = 3600
+    external_id: str | None = None
+
+
+@dataclass
+class AwsSigV4CredentialSpec:
+    """Where the parent resolves the ``aws_sigv4`` credential from.
+
+    Exactly one of two shapes: a static 3-part credential (each part
+    resolved via the existing ``{env|file|command}`` source model, for an
+    externally rotated key or a pre-minted session token), or
+    :attr:`assume_role` (the parent mints and auto-refreshes temporary
+    credentials via STS).
+
+    :param access_key_id: Static access key id source. ``None`` when
+        using :attr:`assume_role`.
+    :param secret_access_key: Static secret key source. ``None`` when
+        using :attr:`assume_role`.
+    :param session_token: Optional static session-token source (for an
+        externally pre-minted temporary credential). Never set together
+        with :attr:`assume_role`, which mints its own.
+    :param assume_role: STS ``AssumeRole`` parameters. ``None`` when using
+        a static credential.
+    """
+
+    access_key_id: CredentialSourceSpec | None = None
+    secret_access_key: CredentialSourceSpec | None = None
+    session_token: CredentialSourceSpec | None = None
+    assume_role: AwsAssumeRoleSpec | None = None
+
+
+@dataclass
+class AwsSigV4ProxyEntry:
+    """One normalized host binding for full AWS SigV4 request re-signing.
+
+    Unlike :class:`CredentialProxyEntry` (verbatim header-value swap), a
+    bound request's ``Authorization``/date/security-token headers are
+    discarded and rebuilt from the literal method/path/query/headers/body
+    going upstream — see
+    :func:`omnigent.inner.egress.aws_sigv4.resign_request`. The body
+    itself, and its ``X-Amz-Content-Sha256`` declaration, are forwarded
+    unchanged.
+
+    :param host: Exact hostname this binding applies to (lower-cased),
+        e.g. ``"mybucket.s3.us-east-1.amazonaws.com"``.
+    :param region: AWS region for the credential scope/canonical request.
+        Declared explicitly rather than parsed from the host, matching
+        every other credential-proxy type's explicit-field style.
+    :param credential: Where the parent resolves the credential from.
+    :param service: SigV4 service name.
+    """
+
+    host: str
+    region: str
+    credential: AwsSigV4CredentialSpec
+    service: str = "s3"
+
+
+@dataclass
 class DatabricksProfileBinding:
     """One Databricks ``~/.databrickscfg`` profile to proxy.
 
@@ -501,10 +579,15 @@ class CredentialProxySpec:
         placeholders that the egress proxy rewrites.
     :param databricks: Optional Databricks-CLI proxy policy (a list of
         profiles). Resolved to per-workspace-host bindings at runtime.
+    :param aws_sigv4: Host-keyed AWS SigV4 re-signing bindings. Unlike
+        :attr:`entries`, these are enforced by a separate egress-proxy
+        mechanism (full request re-signing, not header substitution) — see
+        :class:`AwsSigV4ProxyEntry`.
     """
 
     entries: list[CredentialProxyEntry]
     databricks: DatabricksProxySpec | None = None
+    aws_sigv4: list[AwsSigV4ProxyEntry] = field(default_factory=list)
 
 
 @dataclass
