@@ -281,8 +281,8 @@ def prepare_credential_proxy_runtime(
         )
     if spec.aws_sigv4:
         # Always-on, unlike inject_env: boto3 refuses to build a request
-        # at all with zero credentials configured (git/curl can still
-        # fire an unauthenticated request for swap-on-access; boto3
+        # at all with zero credentials configured (a bare HTTP client can
+        # still fire an unauthenticated request for swap-on-access; boto3
         # cannot). setdefault so an operator's own env_passthrough choice
         # for these names still wins.
         runtime.helper_env_updates.setdefault(
