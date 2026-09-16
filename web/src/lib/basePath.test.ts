@@ -69,6 +69,12 @@ describe("withBasePath", () => {
     expect(withBasePath("/proxy/6767")).toBe("/proxy/6767");
   });
 
+  it("does not double the prefix for a bare-base path carrying a query or hash", () => {
+    setBase("/proxy/6767");
+    expect(withBasePath("/proxy/6767?next=x")).toBe("/proxy/6767?next=x");
+    expect(withBasePath("/proxy/6767#section")).toBe("/proxy/6767#section");
+  });
+
   it("leaves non-absolute paths (full URLs, blob:) untouched", () => {
     setBase("/proxy/6767");
     expect(withBasePath("https://example.com/x")).toBe("https://example.com/x");

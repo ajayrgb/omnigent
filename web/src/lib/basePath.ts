@@ -49,7 +49,15 @@ export function withBasePath(path: string): string {
   const base = getBasePath();
   if (!base) return path;
   if (!path.startsWith("/")) return path;
-  if (path === base || path.startsWith(`${base}/`)) return path;
+  // Already under the base? Treat "/", "?", "#", or end-of-string after the
+  // prefix as the boundary, so a bare-base path carrying a query or hash
+  // (`/proxy/6767?next=x`) is recognized and not prefixed a second time.
+  // Mirrors `rebasePath` in `routing.tsx`.
+  if (path === base) return path;
+  if (path.startsWith(base)) {
+    const boundary = path[base.length];
+    if (boundary === "/" || boundary === "?" || boundary === "#") return path;
+  }
   return `${base}${path}`;
 }
 

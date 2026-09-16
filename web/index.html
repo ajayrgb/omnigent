@@ -5,9 +5,11 @@
       Root-absolute fallback base URI so the build's relative asset refs
       (./assets/...) resolve correctly on a deep-linked route (e.g. /c/<id>)
       even when served by a server that predates the base-path rewrite in
-      omnigent/server/app.py (_rewrite_web_ui_index). That rewrite replaces
-      or ignores this tag: it turns relative refs into absolute ones, which
-      browsers resolve independently of any <base href>.
+      omnigent/server/app.py (_rewrite_web_ui_index). That rewrite turns the
+      relative refs into absolute ones and removes this tag, so fragment refs
+      (inline SVG url(#id), footnote anchors) resolve against the current
+      document rather than the origin root. The tag only takes effect when an
+      older, non-rewriting server serves this file.
     -->
     <base href="/" />
     <meta charset="UTF-8" />

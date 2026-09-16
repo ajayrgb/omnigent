@@ -144,7 +144,10 @@ def server_config_signature(*, include_features: bool = True) -> str:
       Folding the version in makes the next CLI command notice the drift
       and respawn the server on the new code through the existing
       config-drift path in :func:`ensure_local_omnigent_server` — no
-      explicit restart required.
+      explicit restart required; and
+    * the public base path (``OMNIGENT_WEB_BASE_PATH``): the mount prefix is
+      baked into the served HTML and the strip middleware at boot, so a change
+      (e.g. ``server --background --base-path``) must respawn to take effect.
 
     Deliberately narrow otherwise, so unrelated env churn does not force
     needless restarts.
@@ -174,9 +177,15 @@ def server_config_signature(*, include_features: bool = True) -> str:
         # nothing to key version-drift on, so leave it out of the payload.
         version = ""
 
+    # A base-path change must respawn: the mount prefix is baked into the
+    # served HTML and the strip middleware at boot. Canonicalized (strip +
+    # no trailing slash) so a trailing-slash-only difference does not churn.
+    base_path = (os.environ.get("OMNIGENT_WEB_BASE_PATH") or "").strip().rstrip("/")
+
     payload = json.dumps(
         {
             "auth": resolve_auth_source(),
+            "base_path": base_path,
             "features": (resolve_feature_flags().enabled_names() if include_features else ()),
             "session_title_instructions": title_instructions,
             "version": version,

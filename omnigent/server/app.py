@@ -269,12 +269,22 @@ _API_ONLY_LANDING_HTML = Path(__file__).parent / "static" / "api_only_landing.ht
 _WEB_UI_HTML_CACHE_CONTROL = "no-cache"
 _WEB_UI_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _WEB_UI_STATIC_CACHE_CONTROL = "public, max-age=3600"
-_WEB_UI_API_FALLBACK_PREFIXES = frozenset({"api", "auth", "health", "v1", ".well-known"})
+# First-segment namespaces that must keep resolving at the origin root: the JSON
+# API (`api`, `v1`), auth flows (`auth`, `oauth`), health, `.well-known`, and
+# FastAPI's built-in docs endpoints (`docs`, `redoc`, `openapi.json`). Doubles as
+# the SPA-fallback allowlist and the base-path collision check (see
+# `_normalize_base_path` / `_is_web_ui_api_fallback_path`).
+_WEB_UI_API_FALLBACK_PREFIXES = frozenset(
+    {"api", "auth", "docs", "health", "oauth", "openapi.json", "redoc", "v1", ".well-known"}
+)
 
 
-# RFC 3986 unreserved + path separator + percent (for encoded segments).
+# RFC 3986 unreserved + path separator. Percent is deliberately excluded:
+# BasePathMiddleware matches the configured prefix against ASGI's already
+# percent-decoded request path, so an encoded prefix would never match and
+# routing would break silently. Reject it at config time instead.
 _BASE_PATH_ALLOWED = frozenset(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/%"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/"
 )
 
 
@@ -287,10 +297,12 @@ def _normalize_base_path(value: str | None) -> str:
 
     :param value: Raw base path, e.g. ``"/proxy/6767/"`` or ``"proxy/6767"``.
     :returns: Normalized path (``"/proxy/6767"``) or ``""``.
-    :raises ValueError: If the path contains characters outside
+    :raises ValueError: If the path starts with ``//`` (protocol-relative, a
+        cross-origin asset/redirect risk) or contains characters outside
         ``_BASE_PATH_ALLOWED`` — quotes, angle brackets, spaces, backslashes,
-        etc. — since it's spliced into ``index.html`` unescaped and a
-        misconfigured value must not be able to break out of that context.
+        percent, etc. The value is spliced into ``index.html`` unescaped, and
+        percent-encoding would also fail the decoded-path match in
+        ``BasePathMiddleware``.
     """
     if not value:
         return ""
@@ -299,12 +311,32 @@ def _normalize_base_path(value: str | None) -> str:
         return ""
     if not trimmed.startswith("/"):
         trimmed = f"/{trimmed}"
+    if trimmed.startswith("//"):
+        # Protocol-relative (`//evil.example`) spliced into an asset ref would
+        # point at another origin; a slash-only value (`//`, `///`) would rstrip
+        # to empty and hit an IndexError at `segments[1]` below. Reject both here,
+        # before the trailing-slash strip, so misconfiguration fails loud.
+        raise ValueError(f"Invalid base path {value!r}: must not start with '//'.")
     trimmed = trimmed.rstrip("/")
     invalid = set(trimmed) - _BASE_PATH_ALLOWED
     if invalid:
         raise ValueError(
             f"Invalid base path {value!r}: only URL path characters "
-            f"(letters, digits, '-._~/%') are allowed, got {sorted(invalid)!r}."
+            f"(letters, digits, '-._~/') are allowed, got {sorted(invalid)!r}."
+        )
+    segments = trimmed.split("/")
+    if "." in segments or ".." in segments:
+        # A `.`/`..` segment (`/proxy/../app`) is normalized away by the browser,
+        # so the sent path would disagree with the literal prefix the middleware
+        # strips. Reject it.
+        raise ValueError(f"Invalid base path {value!r}: '.'/'..' segments are not allowed.")
+    if segments[1] in _WEB_UI_API_FALLBACK_PREFIXES:
+        # A base path whose first segment is a reserved API namespace (`/v1`,
+        # `/v1/sessions`, `/auth/...`) makes the strip middleware eat canonical
+        # `/{seg}/...` requests, breaking the root-API compatibility guarantee.
+        raise ValueError(
+            f"Invalid base path {value!r}: first segment {segments[1]!r} collides "
+            "with a reserved API route namespace; choose a path outside it."
         )
     return trimmed
 
@@ -328,6 +360,13 @@ def _rewrite_web_ui_index(html: str, base_path: str) -> str:
     :returns: Rewritten HTML.
     """
     rewritten = html.replace('="./', f'="{base_path}/')
+    # Drop the ``<base href="/">`` fallback whenever we rewrite. The asset refs
+    # are absolute now, so it is redundant, and keeping it would resolve fragment
+    # refs (inline SVG ``url(#id)``, footnote/heading anchors) against the origin
+    # root instead of the current document. At root this restores the exact
+    # pre-rewrite markup; the source tag stays as a safety net for an older
+    # server that serves index.html without this rewrite (version skew).
+    rewritten = re.sub(r"<base\b[^>]*>", "", rewritten)
     if base_path:
         # JSON-encode and neutralize any ``</`` so a hostile base path can't
         # break out of the inline script element.

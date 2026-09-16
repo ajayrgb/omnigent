@@ -752,7 +752,14 @@ def create_device_auth_router(
             created_at=now,
             expires_at=now + _DEVICE_CODE_TTL_SECONDS,
         )
-        verification_uri = f"{base_url}/oauth/device"
+        # Advertise the verification URL under the deployment base path so a
+        # subpath-only proxy can route the user to the consent page. Skip when
+        # base_url already carries it (accounts mode's public base_url may).
+        base_path: str = getattr(request.app.state, "base_path", "")
+        public_base = base_url.rstrip("/")
+        if base_path and not public_base.endswith(base_path):
+            public_base = f"{public_base}{base_path}"
+        verification_uri = f"{public_base}/oauth/device"
         verification_uri_complete = f"{verification_uri}?user_code={user_code}"
         _logger.info("device/authorize: issued grant for client=%s", client_id)
         return JSONResponse(

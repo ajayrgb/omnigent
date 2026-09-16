@@ -124,8 +124,10 @@ gotcha).
 
 ## Out of scope / follow-ups
 
-- Full OIDC-behind-subpath (IdP `redirect_uri` must be the public prefixed URL) is
-  governed by `OMNIGENT_ACCOUNTS_BASE_URL`; documented, not re-plumbed here.
+- Full OIDC-behind-subpath: the local logout fallback is now kept under the base
+  path, but the IdP `redirect_uri` / callback must still be the public prefixed
+  URL, configured via `OMNIGENT_OIDC_REDIRECT_URI` (the accounts provider uses
+  `OMNIGENT_ACCOUNTS_BASE_URL`). Documented, not further re-plumbed here.
 - Dev server (`vite`) base-path serving — dev runs at root; the existing
   `OMNIGENT_URL` dev-proxy path handling is unchanged.
 

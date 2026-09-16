@@ -289,10 +289,12 @@ Notes:
 - Leading slash, no trailing slash (`/proxy/6767`). Empty/unset = root
   deployment (unchanged).
 - The root deployment (`http://localhost:6767/`) is unaffected.
-- For accounts/OIDC login behind a subpath, also set
-  `OMNIGENT_ACCOUNTS_BASE_URL` to the full public URL including the prefix
-  (e.g. `https://<host>/proxy/6767`) so login/invite redirects and cookies
-  resolve correctly.
+- For accounts login behind a subpath, also set `OMNIGENT_ACCOUNTS_BASE_URL`
+  to the full public URL including the prefix (e.g.
+  `https://<host>/proxy/6767`) so login/invite redirects and cookies resolve
+  correctly. For OIDC login, set `OMNIGENT_OIDC_REDIRECT_URI` to the full
+  public callback URL including the prefix (e.g.
+  `https://<host>/proxy/6767/auth/callback`).
 
 ## Header-proxy mode (for deploys behind an existing SSO proxy)
 

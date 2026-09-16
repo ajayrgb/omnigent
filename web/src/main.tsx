@@ -11,7 +11,7 @@ import { ImageLightboxProvider } from "./components/ImageLightbox";
 import { RunnerHealthProvider } from "./hooks/RunnerHealthProvider";
 import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
-import { getBasePath } from "./lib/basePath";
+import { getBasePath, withBasePath } from "./lib/basePath";
 import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { CapabilitiesProvider } from "./lib/CapabilitiesContext";
 import { ExtensionProvider } from "./extensions/ExtensionProvider";
@@ -134,7 +134,7 @@ function RootApp({ initialInfo }: { initialInfo: ServerInfo | "loading" }) {
       document.head.appendChild(link);
     }
     link.removeAttribute("type");
-    link.href = faviconUrl;
+    link.href = withBasePath(faviconUrl);
   }, [info]);
   return (
     <CapabilitiesProvider info={info}>

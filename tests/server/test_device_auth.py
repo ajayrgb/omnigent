@@ -455,6 +455,27 @@ def test_consent_page_login_bounce_carries_base_path(
         gen.close()
 
 
+def test_device_authorize_verification_uri_carries_base_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under a base path, the advertised verification_uri stays under the mount.
+
+    A subpath-only proxy has no route for the bare-origin /oauth/device, so a
+    verification_uri that omitted the prefix would leave the device flow with
+    no reachable consent page.
+    """
+    gen = _build_accounts_app(tmp_path, monkeypatch, base_path="/proxy/6767")
+    client = next(gen)
+    try:
+        r = client.post("/oauth/device/authorize", json={"client_id": "slack"})
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["verification_uri"].endswith("/proxy/6767/oauth/device")
+        assert "/proxy/6767/oauth/device?user_code=" in data["verification_uri_complete"]
+    finally:
+        gen.close()
+
+
 def test_unsupported_grant_type(app: TestClient) -> None:
     r = app.post("/oauth/token", data={"grant_type": "password"})
     assert r.status_code == 400 and r.json()["error"] == "unsupported_grant_type"

@@ -48,6 +48,19 @@ def test_normalize_base_path(raw: str | None, expected: str) -> None:
         "/proxy/6767</script><script>",  # script breakout
         "/a b",  # space
         "/a\\b",  # backslash
+        "/team%20space",  # percent: middleware matches the already-decoded path
+        "//evil.example",  # protocol-relative: cross-origin asset/redirect risk
+        "//",  # slash-only: would rstrip to empty and IndexError without the guard
+        "///",  # slash-only variant
+        "/v1",  # first segment is a reserved API namespace
+        "/v1/sessions",  # reserved-namespace descendant (would shadow the API)
+        "/v1/app",  # reserved-namespace descendant
+        "/auth",  # first segment is a reserved API namespace
+        "/oauth",  # reserved: device-flow endpoints live under /oauth
+        "/docs",  # reserved: FastAPI Swagger UI
+        "/redoc",  # reserved: FastAPI ReDoc
+        "/openapi.json",  # reserved: FastAPI OpenAPI schema
+        "/proxy/../app",  # "." / ".." segments a browser would normalize away
     ],
 )
 def test_normalize_base_path_rejects_unsafe_chars(raw: str) -> None:
@@ -56,16 +69,17 @@ def test_normalize_base_path_rejects_unsafe_chars(raw: str) -> None:
         app_module._normalize_base_path(raw)
 
 
-@pytest.mark.parametrize("raw", ["/proxy/6767", "/a-b_c.d~e/f%20g", "/v1/app"])
+@pytest.mark.parametrize("raw", ["/proxy/6767", "/a-b_c.d~e/f", "/authored"])
 def test_normalize_base_path_allows_safe_url_chars(raw: str) -> None:
-    """Ordinary URL path characters (incl. percent-encoding) are accepted."""
+    """Ordinary paths are accepted unchanged; only a reserved *first segment*
+    is rejected, so ``/authored`` (merely starting with ``auth``) is fine."""
     assert app_module._normalize_base_path(raw) == raw
 
 
 def test_rewrite_web_ui_index_absolute_when_no_base() -> None:
     """With no base, relative Vite asset refs become root-absolute and no global is injected."""
     html = (
-        '<!doctype html><head><link rel="icon" href="./favicon.svg" />'
+        '<!doctype html><head><base href="/" /><link rel="icon" href="./favicon.svg" />'
         '<script type="module" src="./assets/index-AbCd1234.js"></script></head>'
     )
     out = app_module._rewrite_web_ui_index(html, "")
@@ -73,12 +87,17 @@ def test_rewrite_web_ui_index_absolute_when_no_base() -> None:
     assert 'href="/favicon.svg"' in out
     assert "./assets/" not in out
     assert "__OMNIGENT_BASE_PATH__" not in out
+    # The rewrite drops the <base> tag (redundant once refs are absolute) so
+    # fragment refs resolve against the document; the served root markup then
+    # matches the pre-rewrite build, which carried no <base>.
+    assert "<base" not in out
 
 
 def test_rewrite_web_ui_index_prefixes_and_injects_with_base() -> None:
     """With a base, asset refs are prefixed and the base path is injected for the SPA."""
     html = (
         "<!doctype html><head>"
+        '<base href="/" />'
         '<link rel="icon" href="./favicon.svg" />'
         '<script type="module" src="./assets/index-AbCd1234.js"></script></head>'
     )
@@ -88,6 +107,8 @@ def test_rewrite_web_ui_index_prefixes_and_injects_with_base() -> None:
     assert 'window.__OMNIGENT_BASE_PATH__ = "/proxy/6767"' in out
     # The injected global must precede the entry module script so it runs first.
     assert out.index("__OMNIGENT_BASE_PATH__") < out.index("assets/index-AbCd1234.js")
+    # The root-absolute <base> is dropped so fragment refs resolve under the prefix.
+    assert "<base" not in out
 
 
 # --------------------------------------------------------------------------- #

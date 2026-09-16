@@ -4287,11 +4287,12 @@ def server(
     # --base-path is sugar for OMNIGENT_WEB_BASE_PATH, which create_app reads.
     # An env var (not a create_app kwarg) so the same toggle reaches every
     # startup path (Docker entrypoint, canonical local server, e2e harness)
-    # that builds the app outside this command. setdefault → explicit env wins.
-    # Folded in before the --background branch below so a detached server
-    # (which spawns inheriting this process's environ) picks it up too.
+    # that builds the app outside this command. Assigned (not setdefault) so an
+    # explicit flag wins over an inherited value and a --background reuse detects
+    # the change. Folded in before the --background branch below so a detached
+    # server (which spawns inheriting this process's environ) picks it up too.
     if base_path:
-        os.environ.setdefault("OMNIGENT_WEB_BASE_PATH", base_path)
+        os.environ["OMNIGENT_WEB_BASE_PATH"] = base_path
 
     if background:
         # `omnigent server --background` is the canonical spelling for the
