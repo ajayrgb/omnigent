@@ -28,6 +28,7 @@ import base64
 import binascii
 import contextlib
 import email.policy
+import functools
 import hmac
 import ipaddress
 import logging

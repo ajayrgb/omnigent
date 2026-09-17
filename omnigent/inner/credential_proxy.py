@@ -86,6 +86,7 @@ class _BrokerSocket(socket.socket):
         self.set_remaining_timeout()
         return super().recv_into(buffer, nbytes, flags)
 
+
 # Placeholder AWS credential injected into the helper env whenever any
 # aws_sigv4 entries are configured. boto3 refuses to build a request with
 # no credentials at all, so the sandbox needs *something* -- these values
