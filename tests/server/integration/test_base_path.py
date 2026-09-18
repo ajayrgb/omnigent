@@ -60,6 +60,8 @@ def test_normalize_base_path(raw: str | None, expected: str) -> None:
         "/docs",  # reserved: FastAPI Swagger UI
         "/redoc",  # reserved: FastAPI ReDoc
         "/openapi.json",  # reserved: FastAPI OpenAPI schema
+        "/assets",  # reserved: collides with the SPA's own static-asset mount
+        "/assets/foo",  # reserved-namespace descendant
         "/proxy/../app",  # "." / ".." segments a browser would normalize away
     ],
 )

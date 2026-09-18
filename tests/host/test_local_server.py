@@ -212,6 +212,74 @@ def test_ensure_local_omnigent_server_respawns_on_config_drift(
     )
 
 
+def test_resolve_effective_base_path_falls_back_to_persisted_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """With no explicit opinion, the running server's persisted base path wins.
+
+    ``OMNIGENT_WEB_BASE_PATH`` is set only by the specific ``server
+    --background --base-path`` invocation that chose it; every later,
+    unrelated command has no opinion on it and must not be read as "root".
+    """
+    base_path_file = tmp_path / "local_server.base_path"
+    monkeypatch.setattr(local_server, "_LOCAL_SERVER_BASE_PATH_PATH", base_path_file)
+    monkeypatch.delenv("OMNIGENT_WEB_BASE_PATH", raising=False)
+
+    # No server has ever recorded one — root.
+    assert local_server._resolve_effective_base_path() == ""
+
+    base_path_file.write_text("/proxy/6767\n")
+    # Still unset this invocation — falls back to the persisted value.
+    assert local_server._resolve_effective_base_path() == "/proxy/6767"
+
+    # An explicit (even empty-after-normalization) opinion overrides it.
+    monkeypatch.setenv("OMNIGENT_WEB_BASE_PATH", "/")
+    assert local_server._resolve_effective_base_path() == ""
+
+    monkeypatch.setenv("OMNIGENT_WEB_BASE_PATH", "/absproxy/9000")
+    assert local_server._resolve_effective_base_path() == "/absproxy/9000"
+
+
+def test_ensure_local_omnigent_server_reuses_configured_base_path_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An invocation with no ``--base-path`` opinion reuses a subpath server.
+
+    Regression test: a server was launched with ``--base-path /proxy/6767``
+    (its sidecars persist that). A later, unrelated invocation (``omnigent
+    run``, ``connect``, ...) does not set ``OMNIGENT_WEB_BASE_PATH`` at all.
+    Before the fix, the signature computed "" for that field, never matched
+    the running server's stamped signature, and every such command silently
+    stopped and respawned the server back at the origin root.
+    """
+    monkeypatch.delenv("OMNIGENT_WEB_BASE_PATH", raising=False)
+    monkeypatch.setattr(
+        local_server, "local_server_url_if_healthy", lambda: "http://127.0.0.1:8123"
+    )
+    base_path_file = tmp_path / "local_server.base_path"
+    base_path_file.write_text("/proxy/6767\n")
+    monkeypatch.setattr(local_server, "_LOCAL_SERVER_BASE_PATH_PATH", base_path_file)
+    # Stamp the sig as the original `--base-path /proxy/6767` launch would
+    # have: computed with that value in effect.
+    sig_file = tmp_path / "local_server.sig"
+    sig_file.write_text(local_server.server_config_signature() + "\n")
+    monkeypatch.setattr(local_server, "_LOCAL_SERVER_SIG_PATH", sig_file)
+    monkeypatch.setattr(
+        local_server, "_LOCAL_SERVER_LOG_REF_PATH", tmp_path / "local_server.logpath"
+    )
+
+    def _must_not_popen(*_args: object, **_kwargs: object) -> Any:
+        raise AssertionError("spawned a new server despite a healthy configured one existing")
+
+    monkeypatch.setattr(local_server.subprocess, "Popen", _must_not_popen)
+
+    result = local_server.ensure_local_omnigent_server()
+    assert result.url == "http://127.0.0.1:8123"
+    assert result.spawned is False
+
+
 def test_server_config_signature_changes_with_features(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -270,12 +270,26 @@ _WEB_UI_HTML_CACHE_CONTROL = "no-cache"
 _WEB_UI_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _WEB_UI_STATIC_CACHE_CONTROL = "public, max-age=3600"
 # First-segment namespaces that must keep resolving at the origin root: the JSON
-# API (`api`, `v1`), auth flows (`auth`, `oauth`), health, `.well-known`, and
-# FastAPI's built-in docs endpoints (`docs`, `redoc`, `openapi.json`). Doubles as
-# the SPA-fallback allowlist and the base-path collision check (see
+# API (`api`, `v1`), auth flows (`auth`, `oauth`), health, `.well-known`,
+# FastAPI's built-in docs endpoints (`docs`, `redoc`, `openapi.json`), and the
+# SPA's own static-asset mount (`assets`) — a base path of `/assets` would be
+# indistinguishable from an already-destripped `/assets/<file>` request under a
+# prefix-stripping proxy, double-stripping it into a 404. Doubles as the
+# SPA-fallback allowlist and the base-path collision check (see
 # `_normalize_base_path` / `_is_web_ui_api_fallback_path`).
 _WEB_UI_API_FALLBACK_PREFIXES = frozenset(
-    {"api", "auth", "docs", "health", "oauth", "openapi.json", "redoc", "v1", ".well-known"}
+    {
+        "api",
+        "assets",
+        "auth",
+        "docs",
+        "health",
+        "oauth",
+        "openapi.json",
+        "redoc",
+        "v1",
+        ".well-known",
+    }
 )
 
 

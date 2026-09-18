@@ -119,6 +119,47 @@ _LOCAL_SERVER_SIG_PATH = _local_data_dir() / "local_server.sig"
 # ``omnigent server`` (its logs stream to the terminal, not a file).
 _LOCAL_SERVER_LOG_REF_PATH = _local_data_dir() / "local_server.logpath"
 
+# Sidecar carrying the normalized base path (one line, "" for root) the
+# running local server was spawned under. Unlike the other signature inputs,
+# this one is also read back on its own: `OMNIGENT_WEB_BASE_PATH` is set only
+# by the specific invocation that chose it, so a later unrelated command
+# (`omnigent run`, `connect`, ...) has no opinion on it and must fall back to
+# this value rather than defaulting to root (see `_resolve_effective_base_path`).
+_LOCAL_SERVER_BASE_PATH_PATH = _local_data_dir() / "local_server.base_path"
+
+
+def _read_local_server_base_path() -> str:
+    """Last resolved base path the running local server was spawned with.
+
+    :returns: Normalized base path (``""`` or ``"/proxy/6767"``), or ``""``
+        if the sidecar is absent (legacy server, root deployment, or no
+        server) or unreadable.
+    """
+    try:
+        return _LOCAL_SERVER_BASE_PATH_PATH.read_text().strip()
+    except OSError:
+        return ""
+
+
+def _resolve_effective_base_path() -> str:
+    """Resolve the base path this invocation implies, falling back to
+    whatever the running server currently carries when unset.
+
+    ``OMNIGENT_WEB_BASE_PATH`` is set only by the specific ``server
+    --background --base-path`` (or foreground ``--base-path``) invocation
+    that chose it. Every later, unrelated command has no opinion on it, so
+    treating "unset" as "root" would make :func:`server_config_signature`
+    see false drift on every such command and silently respawn a configured
+    subpath server back to the origin root. Only an *explicit* different
+    value should trigger a respawn.
+
+    :returns: Normalized base path (``""`` or ``"/proxy/6767"``).
+    """
+    raw = os.environ.get("OMNIGENT_WEB_BASE_PATH")
+    if raw is not None:
+        return raw.strip().rstrip("/")
+    return _read_local_server_base_path()
+
 
 def server_config_signature(*, include_features: bool = True) -> str:
     """
@@ -148,6 +189,11 @@ def server_config_signature(*, include_features: bool = True) -> str:
     * the public base path (``OMNIGENT_WEB_BASE_PATH``): the mount prefix is
       baked into the served HTML and the strip middleware at boot, so a change
       (e.g. ``server --background --base-path``) must respawn to take effect.
+      An invocation with no opinion on it (the env var unset) falls back to
+      whatever the running server currently carries rather than root — see
+      :func:`_resolve_effective_base_path` — so an unrelated command (a plain
+      ``omnigent run``, ``connect``, ...) never looks like drift back to the
+      origin root and silently drops a configured subpath.
 
     Deliberately narrow otherwise, so unrelated env churn does not force
     needless restarts.
@@ -177,10 +223,7 @@ def server_config_signature(*, include_features: bool = True) -> str:
         # nothing to key version-drift on, so leave it out of the payload.
         version = ""
 
-    # A base-path change must respawn: the mount prefix is baked into the
-    # served HTML and the strip middleware at boot. Canonicalized (strip +
-    # no trailing slash) so a trailing-slash-only difference does not churn.
-    base_path = (os.environ.get("OMNIGENT_WEB_BASE_PATH") or "").strip().rstrip("/")
+    base_path = _resolve_effective_base_path()
 
     payload = json.dumps(
         {
@@ -266,11 +309,11 @@ def local_server_url_if_healthy() -> str | None:
 
 
 def _write_local_server_record(
-    pid: int, port: int, sig: str, log_path: Path | None = None
+    pid: int, port: int, sig: str, base_path: str, log_path: Path | None = None
 ) -> None:
-    """Write the pidfile + config-signature sidecar for the canonical server.
+    """Write the pidfile + config-signature sidecars for the canonical server.
 
-    The single writer for all three files so the daemon-spawn and foreground
+    The single writer for all four files so the daemon-spawn and foreground
     (``omnigent server``) registration paths stay symmetric: a server
     that advertises itself in the pidfile ALWAYS stamps a matching sig,
     so reuse-matching in :func:`ensure_local_omnigent_server` can't spuriously
@@ -280,6 +323,10 @@ def _write_local_server_record(
     :param pid: PID to record as the canonical local server.
     :param port: Loopback port the server bound, e.g. ``6767``.
     :param sig: Config signature from :func:`server_config_signature`.
+    :param base_path: Normalized base path this spawn resolved to (from
+        :func:`_resolve_effective_base_path`), persisted so a later
+        invocation with no opinion of its own falls back to it instead of
+        assuming root.
     :param log_path: Absolute path of the spawned server's captured log file,
         e.g. ``Path("/Users/alice/.omnigent/logs/server/server-ab12cd.log")``.
         ``None`` for a foreground server whose logs stream to the terminal —
@@ -293,6 +340,7 @@ def _write_local_server_record(
     # both replaces are individually atomic, so once the pidfile (what reuse
     # keys on) appears, its sig is already fully in place.
     _atomic_write(_LOCAL_SERVER_SIG_PATH, f"{sig}\n")
+    _atomic_write(_LOCAL_SERVER_BASE_PATH_PATH, f"{base_path}\n")
     if log_path is not None:
         _atomic_write(_LOCAL_SERVER_LOG_REF_PATH, f"{log_path}\n")
     else:
@@ -428,6 +476,8 @@ def stop_local_omnigent_server() -> None:
     with contextlib.suppress(OSError):
         _LOCAL_SERVER_SIG_PATH.unlink()
     with contextlib.suppress(OSError):
+        _LOCAL_SERVER_BASE_PATH_PATH.unlink()
+    with contextlib.suppress(OSError):
         _LOCAL_SERVER_LOG_REF_PATH.unlink()
 
 
@@ -526,6 +576,7 @@ def ensure_local_omnigent_server() -> LocalServerStartup:
         a free-port respawn.
     """
     desired_sig = server_config_signature()
+    desired_base_path = _resolve_effective_base_path()
     reused = local_server_url_if_healthy()
     if reused is not None:
         if _read_local_server_sig() == desired_sig:
@@ -562,7 +613,11 @@ def ensure_local_omnigent_server() -> LocalServerStartup:
             # contended port while a foreign server answers its /health,
             # then lose it when that server's owner stops it.
             _write_local_server_record(
-                spawned.proc.pid, port, desired_sig, log_path=spawned.log_path
+                spawned.proc.pid,
+                port,
+                desired_sig,
+                desired_base_path,
+                log_path=spawned.log_path,
             )
             return LocalServerStartup(
                 url=spawned.base_url, spawned=True, log_path=spawned.log_path
@@ -892,16 +947,18 @@ def register_local_server(port: int) -> None:
 
     :param port: The port this server bound, e.g. ``6767``.
     """
-    _write_local_server_record(os.getpid(), port, server_config_signature())
+    _write_local_server_record(
+        os.getpid(), port, server_config_signature(), _resolve_effective_base_path()
+    )
 
 
 def clear_local_server_record() -> None:
-    """Remove the pidfile + sig sidecar if they still point at THIS process.
+    """Remove the pidfile + sidecars if they still point at THIS process.
 
     Called on ``omnigent server`` shutdown so a clean exit doesn't
     leave a stale record. Guarded on the recorded pid matching ours so
     we never delete a daemon-spawned server's record. The pidfile, sig,
-    and log-path sidecar are written together by
+    base-path, and log-path sidecars are written together by
     :func:`_write_local_server_record`, so they must be cleared together
     too — leaving one behind would contradict its meaning ("state of the
     running server").
@@ -912,6 +969,8 @@ def clear_local_server_record() -> None:
             _LOCAL_SERVER_PID_PATH.unlink()
         with contextlib.suppress(OSError):
             _LOCAL_SERVER_SIG_PATH.unlink()
+        with contextlib.suppress(OSError):
+            _LOCAL_SERVER_BASE_PATH_PATH.unlink()
         with contextlib.suppress(OSError):
             _LOCAL_SERVER_LOG_REF_PATH.unlink()
 
@@ -1002,12 +1061,14 @@ def _raise_local_server_failed(base_url: str, log_path: Path) -> None:
     """
     tail = _read_log_tail(log_path)
     _record_server_startup_failure(log_path)
-    # A failed spawn leaves a misleading pidfile; clear it (and the sig
-    # sidecar) so the next invocation does not try to reuse a dead entry.
+    # A failed spawn leaves a misleading pidfile; clear it (and its sidecars)
+    # so the next invocation does not try to reuse a dead entry.
     with contextlib.suppress(OSError):
         _LOCAL_SERVER_PID_PATH.unlink()
     with contextlib.suppress(OSError):
         _LOCAL_SERVER_SIG_PATH.unlink()
+    with contextlib.suppress(OSError):
+        _LOCAL_SERVER_BASE_PATH_PATH.unlink()
     raise LocalServerStartupError(
         f"Background local server failed to start ({base_url}).\n"
         f"  Server log: {log_path}\n"
