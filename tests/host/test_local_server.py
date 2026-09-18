@@ -1698,3 +1698,41 @@ def test_spawn_normalizes_paas_postgres_uri(
 
     uri = captured_args[captured_args.index("--database-uri") + 1]
     assert uri == "postgresql+psycopg://user:pw@127.0.0.1:5432/db"
+
+
+def test_local_server_base_path_applies_only_to_the_local_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The configured prefix is returned for the local managed server's own URL,
+    and never for a remote --server (which carries its own, unknown here) even
+    when this machine's sidecar/env names a base path."""
+    monkeypatch.setattr(
+        local_server, "local_server_url_if_healthy", lambda: "http://127.0.0.1:6767"
+    )
+    monkeypatch.setenv("OMNIGENT_WEB_BASE_PATH", "/proxy/6767")
+
+    # Local managed server URL -> carries the prefix (trailing slash tolerated).
+    assert local_server.local_server_base_path("http://127.0.0.1:6767") == "/proxy/6767"
+    assert local_server.local_server_base_path("http://127.0.0.1:6767/") == "/proxy/6767"
+    # A remote --server is a different URL -> never inherits the local prefix.
+    assert local_server.local_server_base_path("https://remote.example.com") == ""
+
+
+def test_local_server_base_path_empty_for_root_local_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local server with no configured base path yields "" (root, unchanged)."""
+    monkeypatch.setattr(
+        local_server, "local_server_url_if_healthy", lambda: "http://127.0.0.1:6767"
+    )
+    monkeypatch.setenv("OMNIGENT_WEB_BASE_PATH", "")
+    assert local_server.local_server_base_path("http://127.0.0.1:6767") == ""
+
+
+def test_local_server_base_path_empty_when_no_local_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no healthy local server, there is nothing to prefix."""
+    monkeypatch.setattr(local_server, "local_server_url_if_healthy", lambda: None)
+    monkeypatch.setenv("OMNIGENT_WEB_BASE_PATH", "/proxy/6767")
+    assert local_server.local_server_base_path("http://127.0.0.1:6767") == ""

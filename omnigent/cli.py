@@ -8817,9 +8817,16 @@ def _maybe_open_host_web_ui(
     if _resolve_auto_open_conversation_setting(cfg) is False:
         return
     from omnigent.conversation_browser import open_conversation_url
+    from omnigent.host.local_server import local_server_base_path
     from omnigent.util.server_url import display_server_url
 
     web_url = display_server_url(server_url)
+    # A local server started with --base-path serves the UI under that prefix;
+    # opening the bare root renders blank (BrowserRouter basename mismatch).
+    # No-op for a remote --server or an unconfigured/root local server.
+    base_path = local_server_base_path(server_url)
+    if base_path:
+        web_url = web_url.rstrip("/") + base_path
     try:
         opened = open_conversation_url(web_url)
     except OSError:

@@ -308,6 +308,28 @@ def local_server_url_if_healthy() -> str | None:
     return None
 
 
+def local_server_base_path(server_url: str) -> str:
+    """Base path our local managed server serves under, or ``""``.
+
+    Returns the configured prefix (e.g. ``"/proxy/6767"``) only when
+    *server_url* is this machine's healthy local managed server; ``""`` for a
+    remote ``--server`` (whose own prefix is unknown here and must not inherit
+    this machine's sidecar value) or an unconfigured/root local server.
+
+    Browser-facing URLs for the local server must carry this prefix: the SPA
+    (and its BrowserRouter basename) is served under it, so opening the bare
+    root loads a shell whose router matches nothing and renders blank.
+
+    :param server_url: The server the CLI is about to open, e.g.
+        ``"http://127.0.0.1:6767"`` or a remote ``--server`` URL.
+    :returns: The prefix to append to a browser URL, or ``""``.
+    """
+    local_url = local_server_url_if_healthy()
+    if local_url and server_url.rstrip("/") == local_url.rstrip("/"):
+        return _resolve_effective_base_path()
+    return ""
+
+
 def _write_local_server_record(
     pid: int, port: int, sig: str, base_path: str, log_path: Path | None = None
 ) -> None:
