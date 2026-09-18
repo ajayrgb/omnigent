@@ -62,6 +62,10 @@ def test_normalize_base_path(raw: str | None, expected: str) -> None:
         "/openapi.json",  # reserved: FastAPI OpenAPI schema
         "/assets",  # reserved: collides with the SPA's own static-asset mount
         "/assets/foo",  # reserved-namespace descendant
+        "/c",  # reserved: collides with the SPA's own /c/<conversationId> route
+        "/c/foo",  # reserved-namespace descendant
+        "/login",  # reserved: collides with the SPA's own /login route
+        "/settings",  # reserved: collides with the SPA's own /settings route
         "/proxy/../app",  # "." / ".." segments a browser would normalize away
     ],
 )

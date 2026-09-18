@@ -292,6 +292,37 @@ _WEB_UI_API_FALLBACK_PREFIXES = frozenset(
     }
 )
 
+# First segments of the SPA's own top-level routes (web/src/App.tsx). A base
+# path colliding with one of these is ambiguous for the frontend's
+# `withBasePath` (web/src/lib/basePath.ts): it treats a path already starting
+# with the configured base as "already prefixed" to avoid double-prefixing a
+# redirect target that genuinely is one (e.g. an already-absolute return_to
+# read back from `window.location`). With `--base-path /c`, a share link for
+# session `<id>` — the unprefixed app path `/c/<id>` — is misread as already
+# under the `/c` base and left unprefixed, producing a dead link instead of
+# `/c/c/<id>`. Rejected here rather than made "smarter" client-side: the
+# ambiguity is unresolvable in general (a base of `/login` has the same
+# problem for the post-login redirect). NOT folded into
+# `_WEB_UI_API_FALLBACK_PREFIXES`: unlike that set, these ARE legitimate SPA
+# routes that must still fall back to `index.html` when unmatched by a
+# static file, just never as a base-path prefix.
+_WEB_UI_ROUTE_PREFIXES = frozenset(
+    {
+        "approve",
+        "c",
+        "canvas",
+        "extensions",
+        "inbox",
+        "login",
+        "members",
+        "policies",
+        "register",
+        "settings",
+        "tasks",
+        "usage",
+    }
+)
+
 
 # RFC 3986 unreserved + path separator. Percent is deliberately excluded:
 # BasePathMiddleware matches the configured prefix against ASGI's already
@@ -351,6 +382,17 @@ def _normalize_base_path(value: str | None) -> str:
         raise ValueError(
             f"Invalid base path {value!r}: first segment {segments[1]!r} collides "
             "with a reserved API route namespace; choose a path outside it."
+        )
+    if segments[1] in _WEB_UI_ROUTE_PREFIXES:
+        # A base path whose first segment names one of the SPA's own routes
+        # (`/c`, `/login`, ...) is ambiguous for withBasePath's "already
+        # prefixed?" check on the frontend (web/src/lib/basePath.ts): an
+        # unprefixed app path like `/c/<id>` (a share link) is
+        # indistinguishable from an already-prefixed one under base `/c`, so
+        # it is left unprefixed instead of becoming `/c/c/<id>`.
+        raise ValueError(
+            f"Invalid base path {value!r}: first segment {segments[1]!r} collides "
+            "with a top-level app route; choose a path outside it."
         )
     return trimmed
 

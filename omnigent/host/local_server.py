@@ -596,7 +596,7 @@ def ensure_local_omnigent_server() -> LocalServerStartup:
     port = pick_local_port()
     retried = False
     while True:
-        spawned = _spawn_local_server(port)
+        spawned = _spawn_local_server(port, desired_base_path)
         startup_error: click.ClickException | None = None
         try:
             _wait_for_local_omnigent_server(spawned.base_url, spawned.proc, spawned.log_path)
@@ -700,7 +700,7 @@ def _foreign_port_owner(port: int, own_pid: int) -> int | None:
     return owner
 
 
-def _spawn_local_server(port: int) -> _SpawnedLocalServer:
+def _spawn_local_server(port: int, base_path: str) -> _SpawnedLocalServer:
     """Spawn the detached background server subprocess on *port*.
 
     Deliberately does NOT write the pidfile record: the caller
@@ -709,6 +709,13 @@ def _spawn_local_server(port: int) -> _SpawnedLocalServer:
     observe a record for a port this spawn may abandon.
 
     :param port: Loopback TCP port for the child to bind, e.g. ``6767``.
+    :param base_path: Resolved base path from :func:`_resolve_effective_base_path`
+        — explicitly injected rather than left to the child's inherited
+        environment, since the invocation triggering this spawn (a crash
+        recovery, a version-drift respawn, ...) may have no
+        ``OMNIGENT_WEB_BASE_PATH`` opinion of its own; without this, the
+        child would boot at root while the sidecar record (stamped from the
+        same resolution) claims the configured prefix.
     :returns: The spawned subprocess plus its log path and base URL; the
         caller awaits readiness via :func:`_wait_for_local_omnigent_server`.
     """
@@ -744,7 +751,11 @@ def _spawn_local_server(port: int) -> _SpawnedLocalServer:
     # POV, `omnigent run` (no --server) in accounts mode gets
     # "browser auto-opens signed in + TUI auto-signed in" once
     # the spawned server's bootstrap fires.
-    child_env = {**os.environ, PROCESS_LOG_FILE_ENV_VAR: str(log_path)}
+    child_env = {
+        **os.environ,
+        PROCESS_LOG_FILE_ENV_VAR: str(log_path),
+        "OMNIGENT_WEB_BASE_PATH": base_path,
+    }
     # Mirror create_auth_provider's resolution via the shared helper so the
     # daemon-owned server agrees with the server's own auth wiring: header is
     # the env-unset default; OMNIGENT_AUTH_ENABLED=1 opts into accounts (or
