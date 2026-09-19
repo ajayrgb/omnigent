@@ -729,11 +729,9 @@ export function ChatPage() {
   // Hoisted above the early-return guards so the title-update effect can read them.
   const activeConv = sessionConvId ? conversations?.find((c) => c.id === sessionConvId) : null;
 
-  // `isWorking` gates the parent's OWN turn (Stop/Interrupt) and must NOT
-  // include child-session activity. `showsWorking` is display-only (tab title
-  // + shimmer/pill) for the main chat and is suppressed mid-elicitation or
-  // when the runner is known offline.
-  const isWorking = !hasPendingElicitation && computeIsWorking(sessionStatus);
+  // Keep the parent's Stop action live while its turn waits on an elicitation.
+  // Child activity and display suppression belong to `showsWorking` below.
+  const isWorking = computeIsWorking(sessionStatus);
   // Managed-sandbox stages own the in-progress slot with specific pipeline
   // copy. A normal terminal runner launch keeps the standard Working shimmer
   // so startup does not introduce a second, special chat state.
@@ -2888,7 +2886,7 @@ function ComposerImpl(
 
   // Depends on mentionedItems (from the hook above), so it's computed here.
   const hasDraft = fullText.trim().length > 0 || files.length > 0 || mentionedItems.length > 0;
-  const showInterruptButton = isWorking && !hasDraft;
+  const showInterruptButton = isWorking && (!hasDraft || hasPendingElicitation);
 
   // Drain externally-queued attachments (file viewer "Attach to agent") into
   // the local mention chips, deduping against what's already tagged, then
