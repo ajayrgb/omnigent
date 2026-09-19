@@ -1703,28 +1703,29 @@ def test_spawn_normalizes_paas_postgres_uri(
 def test_local_server_base_path_applies_only_to_the_local_server(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The configured prefix is returned for the local managed server's own URL,
-    and never for a remote --server (which carries its own, unknown here) even
-    when this machine's sidecar/env names a base path."""
-    monkeypatch.setattr(
-        local_server, "local_server_url_if_healthy", lambda: "http://127.0.0.1:6767"
-    )
+    """The configured prefix is returned for the local managed server (loopback
+    on the recorded pidfile port), and never for a remote --server or a
+    different port, even when this machine's sidecar/env names a base path.
+
+    Probe-free: matches against the recorded pidfile, not a /health probe."""
+    monkeypatch.setattr(local_server, "_read_local_server_pid_file", lambda: (4242, 6767))
     monkeypatch.setenv("OMNIGENT_WEB_BASE_PATH", "/proxy/6767")
 
     # Local managed server URL -> carries the prefix (trailing slash tolerated).
     assert local_server.local_server_base_path("http://127.0.0.1:6767") == "/proxy/6767"
     assert local_server.local_server_base_path("http://127.0.0.1:6767/") == "/proxy/6767"
-    # A remote --server is a different URL -> never inherits the local prefix.
+    assert local_server.local_server_base_path("http://localhost:6767") == "/proxy/6767"
+    # A remote --server is a different host -> never inherits the local prefix.
     assert local_server.local_server_base_path("https://remote.example.com") == ""
+    # A different loopback port is a different server -> no prefix.
+    assert local_server.local_server_base_path("http://127.0.0.1:9999") == ""
 
 
 def test_local_server_base_path_empty_for_root_local_server(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A local server with no configured base path yields "" (root, unchanged)."""
-    monkeypatch.setattr(
-        local_server, "local_server_url_if_healthy", lambda: "http://127.0.0.1:6767"
-    )
+    monkeypatch.setattr(local_server, "_read_local_server_pid_file", lambda: (4242, 6767))
     monkeypatch.setenv("OMNIGENT_WEB_BASE_PATH", "")
     assert local_server.local_server_base_path("http://127.0.0.1:6767") == ""
 
@@ -1732,7 +1733,7 @@ def test_local_server_base_path_empty_for_root_local_server(
 def test_local_server_base_path_empty_when_no_local_server(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With no healthy local server, there is nothing to prefix."""
-    monkeypatch.setattr(local_server, "local_server_url_if_healthy", lambda: None)
+    """With no local server pidfile, there is nothing to prefix."""
+    monkeypatch.setattr(local_server, "_read_local_server_pid_file", lambda: None)
     monkeypatch.setenv("OMNIGENT_WEB_BASE_PATH", "/proxy/6767")
     assert local_server.local_server_base_path("http://127.0.0.1:6767") == ""

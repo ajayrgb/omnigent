@@ -476,6 +476,27 @@ def test_device_authorize_verification_uri_carries_base_path(
         gen.close()
 
 
+def test_consent_html_prefixes_form_actions_under_base_path() -> None:
+    """The consent page's form actions carry the base path so the POST/GET
+    reaches the app behind a stripping proxy (the page is not run through the
+    SPA rewrite); at the origin root they are unprefixed (unchanged)."""
+    from omnigent.server.routes.device_auth import _consent_html
+
+    prompt = _consent_html(prompt_for_code=True, base_path="/proxy/6767")
+    assert 'action="/proxy/6767/oauth/device"' in prompt
+
+    authorize = _consent_html(
+        user_code="ABCD-1234", user_id="u@example.com", base_path="/proxy/6767"
+    )
+    assert 'action="/proxy/6767/oauth/device/approve"' in authorize
+    assert 'action="/proxy/6767/oauth/device/deny"' in authorize
+
+    root = _consent_html(user_code="ABCD-1234", user_id="u@example.com")
+    assert 'action="/oauth/device/approve"' in root
+    assert 'action="/oauth/device/deny"' in root
+    assert "/proxy" not in root
+
+
 def test_unsupported_grant_type(app: TestClient) -> None:
     r = app.post("/oauth/token", data={"grant_type": "password"})
     assert r.status_code == 400 and r.json()["error"] == "unsupported_grant_type"

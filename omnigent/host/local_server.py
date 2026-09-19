@@ -312,20 +312,30 @@ def local_server_base_path(server_url: str) -> str:
     """Base path our local managed server serves under, or ``""``.
 
     Returns the configured prefix (e.g. ``"/proxy/6767"``) only when
-    *server_url* is this machine's healthy local managed server; ``""`` for a
-    remote ``--server`` (whose own prefix is unknown here and must not inherit
-    this machine's sidecar value) or an unconfigured/root local server.
+    *server_url* is this machine's local managed server (loopback host on the
+    port recorded in the pidfile); ``""`` for a remote ``--server`` (whose own
+    prefix is unknown here and must not inherit this machine's sidecar value)
+    or an unconfigured/root local server.
 
     Browser-facing URLs for the local server must carry this prefix: the SPA
     (and its BrowserRouter basename) is served under it, so opening the bare
     root loads a shell whose router matches nothing and renders blank.
 
+    Probe-free by design (reads only the pidfile and the env/sidecar): safe to
+    call on hot paths such as ``conversation_url`` per printed/opened link.
+
     :param server_url: The server the CLI is about to open, e.g.
         ``"http://127.0.0.1:6767"`` or a remote ``--server`` URL.
     :returns: The prefix to append to a browser URL, or ``""``.
     """
-    local_url = local_server_url_if_healthy()
-    if local_url and server_url.rstrip("/") == local_url.rstrip("/"):
+    from urllib.parse import urlsplit
+
+    existing = _read_local_server_pid_file()
+    if existing is None:
+        return ""
+    _pid, port = existing
+    parsed = urlsplit(server_url)
+    if parsed.hostname in ("127.0.0.1", "localhost", "::1") and parsed.port == port:
         return _resolve_effective_base_path()
     return ""
 
