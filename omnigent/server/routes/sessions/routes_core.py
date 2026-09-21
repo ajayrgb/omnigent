@@ -868,6 +868,7 @@ def register_core_routes(
             spec,
             inference_snapshot,
             inference_model,
+            created_by=user_id,
         )
         # Top-level creates (no inherited runner) skip the notify —
         # their runner registers itself later.
@@ -1041,6 +1042,7 @@ def register_core_routes(
         include_items: bool = Query(default=True),
         include_liveness: bool = Query(default=True),
         refresh_state: bool = Query(default=False),
+        include_usage: bool = Query(default=True),
     ) -> SessionResponse:
         """
         Return a session snapshot: identity, status, and committed
@@ -1061,6 +1063,11 @@ def register_core_routes(
             as ``None``. The web chat surface passes ``False`` because
             it sources liveness from the ``/health`` poll and the WS
             stream, not the snapshot.
+        :param include_usage: When ``False``, skip the subtree usage read and
+            return null usage fields with ``usage_included=False``. Display
+            clients can independently request this route with
+            ``include_usage=true``, ``include_items=false``,
+            ``include_liveness=false``, and ``refresh_state=false``.
         :param refresh_state: When ``True``, refresh runner-derived
             snapshot overlays from the live session instead of serving
             stale AP-process caches. Browser reload/bind requests use
@@ -1088,6 +1095,7 @@ def register_core_routes(
             conversation=access.conversation,
             liveness_lookup=liveness_lookup if include_liveness else None,
             include_items=include_items,
+            include_usage=include_usage,
             runner_exit_reports=runner_exit_reports,
             refresh_state=refresh_state,
             host_store=getattr(request.app.state, "host_store", None),
@@ -2026,6 +2034,7 @@ def register_core_routes(
         request: Request,
         session_id: str,
         body: UpdateSessionRequest,
+        include_usage: bool = Query(default=True),
     ) -> SessionResponse:
         """
         Update a session's mutable fields. When ``runner_id`` is
@@ -2041,6 +2050,8 @@ def register_core_routes(
         :param session_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
         :param body: The validated :class:`UpdateSessionRequest`.
+        :param include_usage: When ``False``, skip usage aggregation in the
+            response. Metadata writes during native launch do not need it.
         :returns: The updated :class:`SessionResponse` snapshot, with
             ``items`` always empty — PATCH callers use only scalar
             fields, and transcripts are served by
@@ -2753,6 +2764,7 @@ def register_core_routes(
             agent_cache,
             liveness_lookup=liveness_lookup,
             include_items=False,
+            include_usage=include_usage,
             runner_exit_reports=runner_exit_reports,
             viewer_id=user_id,
             request=request,
@@ -3223,6 +3235,7 @@ def register_core_routes(
                 up_to_response_id=body.up_to_response_id,
                 project_id=fork_project_id,
                 file_id_map=fork_file_id_map,
+                created_by=user_id,
             )
         except LookupError as exc:
             raise OmnigentError(

@@ -971,6 +971,14 @@ async def _launch_config_retry_sleep(delay: float) -> None:
     await asyncio.sleep(delay)
 
 
+# Metadata reads do not need transcript, liveness, or subtree-usage aggregation.
+_SESSION_METADATA_PARAMS: dict[str, str] = {
+    "include_items": "false",
+    "include_liveness": "false",
+    "include_usage": "false",
+}
+
+
 async def _fetch_native_launch_snapshot(
     *,
     server_client: httpx.AsyncClient | None,
@@ -1004,7 +1012,9 @@ async def _fetch_native_launch_snapshot(
     for attempt in range(1, _LAUNCH_CONFIG_FETCH_ATTEMPTS + 1):
         last_attempt = attempt == _LAUNCH_CONFIG_FETCH_ATTEMPTS
         try:
-            resp = await server_client.get(path, timeout=_LAUNCH_CONFIG_FETCH_TIMEOUT_S)
+            resp = await server_client.get(
+                path, params=_SESSION_METADATA_PARAMS, timeout=_LAUNCH_CONFIG_FETCH_TIMEOUT_S
+            )
         except httpx.HTTPError as exc:
             if last_attempt or not _launch_config_fetch_is_transient(exc):
                 raise RuntimeError(
@@ -1696,6 +1706,7 @@ async def _auto_create_opencode_terminal(
                         await server_client.patch(
                             f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
                             json={"external_session_id": opencode_session_id},
+                            params={"include_usage": "false"},
                             timeout=10.0,
                         )
         finally:
@@ -2353,6 +2364,7 @@ async def _resolve_pi_resume_session(
                 await server_client.patch(
                     f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
                     json={"external_session_id": minted},
+                    params={"include_usage": "false"},
                     timeout=10.0,
                 )
             except httpx.HTTPError:
@@ -3803,6 +3815,7 @@ async def _persist_qwen_external_session_id(
         resp = await server_client.patch(
             f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
             json={"external_session_id": qwen_session_id},
+            params={"include_usage": "false"},
             timeout=10.0,
         )
     except httpx.HTTPError:
@@ -4662,6 +4675,7 @@ async def _auto_create_codex_terminal(
                     await server_client.patch(
                         f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
                         json={"external_session_id": target_thread_id},
+                        params={"include_usage": "false"},
                         timeout=10.0,
                     )
                 except httpx.HTTPError:
@@ -4731,6 +4745,7 @@ async def _auto_create_codex_terminal(
                 await server_client.patch(
                     f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
                     json={"external_session_id": target_thread_id},
+                    params={"include_usage": "false"},
                     timeout=10.0,
                 )
             except httpx.HTTPError:
@@ -4860,6 +4875,7 @@ async def _auto_create_codex_terminal(
         ap_auth_headers=policy_headers,
         bypass_sandbox=launch_config.bypass_sandbox,
         developer_instructions=_codex_developer_instructions,
+        terminal_launch_args=launch_config.terminal_launch_args or (),
         reasoning_effort=launch_config.reasoning_effort,
         model_catalog_rows=_fresh_codex_catalog,
         # Codex can show project-trust and legacy-model migration prompts before
@@ -4926,6 +4942,7 @@ async def _auto_create_codex_terminal(
                 codex_ws_url,
                 launch_config.external_session_id,
                 terminal_launch_args=launch_config.terminal_launch_args,
+                cwd=Path(workspace),
                 retain_client=codex_remote_resume_omits_permission_args(
                     app_server.codex_cli_version
                 ),
@@ -5440,6 +5457,7 @@ async def _codex_discover_thread_and_forward(
                 _ext_resp = await _ext_client.patch(
                     f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
                     json={"external_session_id": thread_id},
+                    params={"include_usage": "false"},
                 )
             if _ext_resp.status_code >= 400:
                 _logger.warning(
@@ -6294,6 +6312,7 @@ async def _session_payload_for_host_spawn_check(
     try:
         resp = await server_client.get(
             f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+            params=_SESSION_METADATA_PARAMS,
             timeout=10.0,
         )
     except httpx.HTTPError:
@@ -7159,6 +7178,7 @@ async def _load_legacy_claude_launch_metadata(
     try:
         response = await server_client.get(
             f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+            params=_SESSION_METADATA_PARAMS,
             timeout=10.0,
         )
     except httpx.HTTPError:
@@ -7275,6 +7295,7 @@ async def _clear_session_model_override(
             resp = await server_client.patch(
                 session_path,
                 json={"model_override": "default"},
+                params={"include_usage": "false"},
                 timeout=10.0,
             )
         resp.raise_for_status()
@@ -7405,6 +7426,7 @@ async def _auto_create_claude_terminal(
             await server_client.patch(
                 f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
                 json={"labels": {BRIDGE_ID_LABEL_KEY: bridge_id}},
+                params={"include_usage": "false"},
             )
         except httpx.HTTPError:
             _logger.debug(
@@ -7594,6 +7616,7 @@ async def _auto_create_claude_terminal(
                     await server_client.patch(
                         f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
                         json={"external_session_id": our_uuid},
+                        params={"include_usage": "false"},
                         timeout=10.0,
                     )
                 except httpx.HTTPError:
@@ -7656,6 +7679,7 @@ async def _auto_create_claude_terminal(
                 await server_client.patch(
                     f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
                     json={"external_session_id": our_uuid},
+                    params={"include_usage": "false"},
                     timeout=10.0,
                 )
             except httpx.HTTPError:
@@ -8313,6 +8337,7 @@ async def _auto_create_repl_terminal(
         await server_client.patch(
             f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
             json={"labels": {UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE}},
+            params={"include_usage": "false"},
         )
     except httpx.HTTPError:
         _logger.warning(
@@ -9057,6 +9082,7 @@ async def _claude_native_session_wants_rebuild(
     try:
         resp = await server_client.get(
             f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+            params=_SESSION_METADATA_PARAMS,
             timeout=10.0,
         )
     except httpx.HTTPError:

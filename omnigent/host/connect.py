@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, SupportsIndex, SupportsInt, TypeVar, cast
 
+import click
 import httpx
 import psutil
 import websockets.asyncio.client
@@ -3104,6 +3105,14 @@ class HostProcess:
                 from omnigent.harnesses.devin_native.main import list_devin_cli_model_options
 
                 devin_models = await asyncio.to_thread(list_devin_cli_model_options)
+            except click.ClickException as exc:
+                # A missing optional CLI is an expected picker result, even when
+                # an older client keeps requesting its catalog.
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error=str(exc),
+                )
             except Exception:  # noqa: BLE001 — no catalog, never a crash
                 _logger.warning("Devin model catalog unavailable", exc_info=True)
                 return HostModelOptionsResultFrame(
@@ -3417,7 +3426,7 @@ class HostProcess:
         loop keeps servicing pings.
 
         :param frame: The list-worktrees request frame.
-        :returns: Result frame with the worktrees on success, or
+        :returns: Result frame with worktrees on success, or
             ``status: "failed"`` with an error message.
         """
         try:
@@ -3443,6 +3452,7 @@ class HostProcess:
                     "branch": wt.branch,
                     "is_main": wt.is_main,
                     "detached": wt.detached,
+                    "updated_at": wt.updated_at,
                 }
                 for wt in worktrees
             ],

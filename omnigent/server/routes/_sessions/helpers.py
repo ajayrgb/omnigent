@@ -1810,6 +1810,9 @@ def _resolve_llm_model(
         OSError,
         RuntimeError,
         StatementError,
+        # A corrupt/unparseable cached bundle (e.g. a spec-load race) must
+        # degrade the same as a missing agent, not crash the caller.
+        OmnigentError,
     ):
         # ``RuntimeError`` covers ``get_agent_cache()`` before the runtime is
         # initialized: this is a best-effort display resolver (now also called
@@ -1902,6 +1905,9 @@ def _resolve_harness_impl(
         OSError,
         RuntimeError,
         StatementError,
+        # A corrupt/unparseable cached bundle (e.g. a spec-load race) must
+        # degrade the same as a missing agent, not crash the caller.
+        OmnigentError,
     ):
         return None
 
@@ -9778,6 +9784,7 @@ def _persist_stored_session_bundle(
     runner_id: str | None = None,
     inference_snapshot: dict[str, Any] | None = None,
     inference_model: str | None = None,
+    created_by: str | None = None,
 ) -> CreatedSessionResponse:
     """
     Persist database rows for a bundle already written to artifacts.
@@ -9794,6 +9801,9 @@ def _persist_stored_session_bundle(
     :param agent_description: Optional description from the spec.
     :param runner_id: Optional runner binding inherited from the
         parent session, e.g. ``"runner_abc123"``.
+    :param created_by: Identity of the creating user, recorded on the
+        session-scoped agent so its code can only be mutated by the owner.
+        ``None`` in single-user mode.
     :returns: Response with the new session id.
     :raises OmnigentError: If the agent insert violates integrity
         checks or the parent session no longer exists.
@@ -9820,6 +9830,7 @@ def _persist_stored_session_bundle(
             runner_id=runner_id,
             project_id=metadata.project_id,
             host_id=metadata.host_id,
+            created_by=created_by,
             **inference_kwargs,
         )
     except ConversationNotFoundError as exc:
