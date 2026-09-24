@@ -1548,6 +1548,43 @@ class _AwsSigV4CredentialModel(BaseModel):  # type: ignore[explicit-any]
         return value
 
     @model_validator(mode="after")
+    def _check_static_source_scope(self) -> _AwsSigV4CredentialModel:
+        """
+        Restrict static credential parts to ``env``/``file``/``command``.
+
+        Unlike other ``credential_proxy`` source fields, an aws_sigv4 static
+        part is never routed through :func:`protect_credential_source` or
+        :class:`RefreshingSecretProvider` (the host is resolved once per
+        proxy rule, not per outbound request), so a ``unix_socket`` source
+        would silently skip the sandbox-path guard those give every other
+        credential type, and ``refresh_interval_seconds`` would silently
+        never refresh. Reject both here instead.
+
+        :returns: ``self`` once validated.
+        :raises ValueError: If a static part sets ``unix_socket`` or
+            ``refresh_interval_seconds``.
+        """
+        for name, source in (
+            ("access_key_id", self.access_key_id),
+            ("secret_access_key", self.secret_access_key),
+            ("session_token", self.session_token),
+        ):
+            if source is None:
+                continue
+            if source.unix_socket is not None:
+                raise ValueError(
+                    f"aws_sigv4 credential {name!r} does not accept a 'unix_socket' "
+                    "source; use 'env', 'file', or 'command'"
+                )
+            if source.refresh_interval_seconds is not None:
+                raise ValueError(
+                    f"aws_sigv4 credential {name!r} does not support "
+                    "'refresh_interval_seconds'; use 'profile' or 'assume_role' for "
+                    "credentials that need to refresh"
+                )
+        return self
+
+    @model_validator(mode="after")
     def _check_shape(self) -> _AwsSigV4CredentialModel:
         """
         Enforce static-vs-profile-vs-assume_role exclusivity.
@@ -1778,6 +1815,8 @@ class _CredentialProxyItemModel(BaseModel):  # type: ignore[explicit-any]
             raise ValueError("aws_sigv4 requires 'credential'")
         if self.region is None or not self.region.strip():
             raise ValueError("aws_sigv4 requires a non-empty 'region'")
+        if self.service is not None and not self.service.strip():
+            raise ValueError("aws_sigv4 'service' must be a non-empty string")
         has_target = self.target is not None
         has_targets = self.targets is not None
         if has_targets and not self.targets:

@@ -4499,6 +4499,43 @@ def test_parse_credential_proxy_aws_sigv4_allowed_on_macos(tmp_path: Path) -> No
             },
             r"'profile' must be a non-empty string",
         ),
+        (
+            {
+                "type": "aws_sigv4",
+                "target": "mybucket.s3.us-east-1.amazonaws.com",
+                "region": "us-east-1",
+                "credential": {
+                    "access_key_id": {"unix_socket": "/tmp/broker.sock"},
+                    "secret_access_key": {"env": "B"},
+                },
+            },
+            r"'access_key_id' does not accept a 'unix_socket' source",
+        ),
+        (
+            {
+                "type": "aws_sigv4",
+                "target": "mybucket.s3.us-east-1.amazonaws.com",
+                "region": "us-east-1",
+                "credential": {
+                    "access_key_id": {"env": "A"},
+                    "secret_access_key": {"file": "/tmp/secret", "refresh_interval_seconds": 30},
+                },
+            },
+            r"'secret_access_key' does not support 'refresh_interval_seconds'",
+        ),
+        (
+            {
+                "type": "aws_sigv4",
+                "target": "mybucket.s3.us-east-1.amazonaws.com",
+                "region": "us-east-1",
+                "credential": {
+                    "access_key_id": {"env": "A"},
+                    "secret_access_key": {"env": "B"},
+                },
+                "service": "  ",
+            },
+            r"'service' must be a non-empty string",
+        ),
     ],
 )
 def test_parse_credential_proxy_aws_sigv4_fail_loud(
