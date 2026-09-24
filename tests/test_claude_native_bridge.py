@@ -24,7 +24,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, TextIO
 from unittest.mock import Mock
-from urllib.error import URLError
 
 import pytest
 
@@ -4488,6 +4487,7 @@ def test_inject_user_message_ignores_prompt_glyph_in_scrollback(
     it, so the gate must NOT treat the pane as ready.
     """
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
         bridge_dir,
@@ -5180,15 +5180,14 @@ def test_tmux_injections_are_serialized_per_bridge(
             self._counter_lock = threading.Lock()
             self._acquire_count = 0
 
-        def __enter__(self) -> ObservedInjectionLock:
+        def acquire(self, *, timeout: float = -1) -> bool:
             with self._counter_lock:
                 self._acquire_count += 1
                 if self._acquire_count == 2:
                     second_lock_acquire_started.set()
-            self._lock.acquire()
-            return self
+            return self._lock.acquire(timeout=timeout)
 
-        def __exit__(self, *_args: object) -> None:
+        def release(self) -> None:
             self._lock.release()
 
     lock_key = os.path.normcase(os.path.abspath(os.fspath(bridge_dir)))
@@ -5207,7 +5206,7 @@ def test_tmux_injections_are_serialized_per_bridge(
         return {"socket_path": "/tmp/tmux.sock", "tmux_target": "claude:0.0"}
 
     monkeypatch.setattr(claude_native_bridge, "_wait_for_tmux_info", wait_for_tmux_info)
-    monkeypatch.setattr(claude_native_bridge, "_restore_occupied_input", lambda *_args: None)
+    monkeypatch.setattr(claude_native_bridge, "_restore_occupied_input", lambda *_a, **_k: None)
     monkeypatch.setattr(
         claude_native_bridge, "_wait_for_claude_prompt_ready", lambda *_a, **_k: None
     )
@@ -5714,7 +5713,7 @@ def test_inject_slash_command_raises_when_tmux_target_never_published(
 @pytest.mark.parametrize(
     "transport_error",
     [
-        URLError("bridge unavailable"),
+        ConnectionRefusedError("bridge unavailable"),
         ConnectionResetError("connection reset"),
         RemoteDisconnected("bridge disconnected"),
         TimeoutError("notification timed out"),
@@ -5727,9 +5726,13 @@ def test_post_tools_changed_normalizes_transport_errors(
     monkeypatch.setattr(
         claude_native_bridge,
         "_wait_for_server_info",
-        Mock(return_value={"url": "http://127.0.0.1:12345", "token": "test-token"}),
+        Mock(return_value={"socket": "/tmp/og-mcp-test.sock", "token": "test-token"}),
     )
-    monkeypatch.setattr(claude_native_bridge.request, "urlopen", Mock(side_effect=transport_error))
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_control_connection",
+        lambda server: Mock(request=Mock(side_effect=transport_error)),
+    )
 
     with pytest.raises(RuntimeError, match="failed to notify Claude tool list change") as caught:
         post_tools_changed(tmp_path)
@@ -5789,10 +5792,12 @@ def test_post_tools_changed_preserves_programming_errors(
     monkeypatch.setattr(
         claude_native_bridge,
         "_wait_for_server_info",
-        Mock(return_value={"url": "http://127.0.0.1:12345", "token": "test-token"}),
+        Mock(return_value={"socket": "/tmp/og-mcp-test.sock", "token": "test-token"}),
     )
     monkeypatch.setattr(
-        claude_native_bridge.request, "urlopen", Mock(side_effect=ValueError("bug"))
+        claude_native_bridge,
+        "_control_connection",
+        lambda server: Mock(request=Mock(side_effect=ValueError("bug"))),
     )
 
     with pytest.raises(ValueError, match="bug"):
@@ -9250,6 +9255,49 @@ def test_hook_record_stop_counts_only_running_background_tasks() -> None:
     assert record.background_task_count == 3
 
 
+def test_hook_record_stop_excludes_backgrounded_subagents() -> None:
+    """Claude ``local_agent`` tasks belong to the sub-agent tally, not shell tally.
+
+    The SDK task lifecycle uses ``local_bash`` and ``local_agent`` task types,
+    including when Ctrl+B moves a foreground sub-agent into the background.
+    Counting both here would show that child in ``BackgroundTaskIndicator`` and
+    ``SubagentTaskIndicator`` at the same time.
+    """
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "Stop",
+                "background_tasks": [
+                    {
+                        "id": "bash-task",
+                        "type": "local_bash",
+                        "status": "running",
+                        "description": "Watch tests",
+                        "command": "pytest -f",
+                    },
+                    {
+                        "id": "agent-task",
+                        "type": "local_agent",
+                        "status": "running",
+                        "description": "Review the change",
+                    },
+                ],
+            }
+        )
+    )
+
+    assert record.background_task_count == 1
+    assert record.background_tasks == [
+        {
+            "id": "bash-task",
+            "type": "local_bash",
+            "status": "running",
+            "description": "Watch tests",
+            "command": "pytest -f",
+        }
+    ]
+
+
 def test_hook_record_stop_all_background_tasks_terminal_counts_zero() -> None:
     """Every shell finished → count is 0, dropping the indicator."""
     record = _hook_record_from_jsonl_record(
@@ -9791,17 +9839,24 @@ def test_a_foreign_dialog_rendering_during_the_watch_gets_no_enter(
     (whose Enter rewrites their global default) or Claude asks for a tool
     permission (whose Enter approves it). Both stay untouched.
     """
-    del name
     sends = _fake_tmux(monkeypatch, [_IDLE_PANE, _IDLE_PANE, foreign_pane])
 
-    assert (
-        claude_native_bridge._confirm_tui_dialog(
-            "/tmp/s.sock",
-            "claude:0.0",
-            hint=claude_native_bridge.EFFORT_DIALOG_HINT,
+    if name == "permission prompt":
+        with pytest.raises(claude_native_bridge.ClaudeUserPromptPending):
+            claude_native_bridge._confirm_tui_dialog(
+                "/tmp/s.sock",
+                "claude:0.0",
+                hint=claude_native_bridge.EFFORT_DIALOG_HINT,
+            )
+    else:
+        assert (
+            claude_native_bridge._confirm_tui_dialog(
+                "/tmp/s.sock",
+                "claude:0.0",
+                hint=claude_native_bridge.EFFORT_DIALOG_HINT,
+            )
+            is False
         )
-        is False
-    )
     assert sends == []
 
 
@@ -9872,6 +9927,7 @@ def test_a_torn_capture_does_not_end_the_confirm_retry(
             "",
             _EFFORT_DIALOG_PANE,
             "",
+            _EFFORT_DIALOG_PANE,
             _IDLE_PANE,
         ],
     )
@@ -9948,34 +10004,38 @@ def test_a_slash_command_submit_waits_for_the_command_to_render(
     while the persisted session value claims the switch applied.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
-    events: list[str] = []
-    frames = ["", _IDLE_PANE, _composer_pane("/effort high"), _IDLE_PANE]
-    served = {"n": 0}
+    clock = _VirtualClock()
+    pasted_at: float | None = None
+    submitted_at: float | None = None
+    draft_seen = False
 
     def _fake_run_tmux(socket_path: str, *args: str) -> None:
+        nonlocal pasted_at, submitted_at
         del socket_path
-        events.append(f"send:{args[-1]}")
+        if args[-1] == "/effort high":
+            pasted_at = clock.monotonic()
+        elif args[-1] == "Enter":
+            assert draft_seen, "Enter arrived before the typed command rendered"
+            submitted_at = clock.monotonic()
 
     def _fake_capture(socket_path: str, tmux_target: str) -> str:
+        nonlocal draft_seen
         del socket_path, tmux_target
-        events.append("capture")
-        frame = frames[min(served["n"], len(frames) - 1)]
-        served["n"] += 1
-        return frame
+        if pasted_at is None or submitted_at is not None:
+            return _IDLE_PANE
+        if clock.monotonic() - pasted_at < 0.3:
+            return ""
+        draft_seen = True
+        return _composer_pane("/effort high")
 
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", _fake_run_tmux)
     monkeypatch.setattr(claude_native_bridge, "_capture_pane", _fake_capture)
-    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
-    first_enter = events.index("send:Enter")
-    captures_before = sum(1 for event in events[:first_enter] if event == "capture")
-    # Blank (occupied-input check) + idle + draft: three captures before
-    # the Enter may fire.
-    assert captures_before == 3, (
-        f"Enter must wait for the command to render (expected 3 captures first); events: {events}"
-    )
+    assert pasted_at is not None and submitted_at is not None
+    assert submitted_at - pasted_at >= 0.3
 
 
 def test_a_swallowed_slash_submit_enter_is_retried_while_the_draft_persists(
@@ -9990,14 +10050,20 @@ def test_a_swallowed_slash_submit_enter_is_retried_while_the_draft_persists(
     the box, so none can reach the cleared composer or a dialog.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
-    sends = _fake_tmux(
-        monkeypatch,
-        [_IDLE_PANE] + [_composer_pane("/effort high")] * 8 + [_IDLE_PANE],
-    )
+    tails: list[str] = []
+
+    def _fake_capture(socket_path: str, tmux_target: str) -> str:
+        del socket_path, tmux_target
+        if "/effort high" in tails and tails.count("Enter") < 2:
+            return _composer_pane("/effort high")
+        return _IDLE_PANE
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", lambda *args: tails.append(args[-1]))
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", _fake_capture)
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
-    tails = [args[-1] for args in sends]
     assert tails == ["C-u", "/effort high", "Enter", "Enter"], (
         f"Expected the swallowed submit Enter to be retried once; got {tails}."
     )
@@ -10205,6 +10271,168 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
     )
     assert tails.count("Escape") == 1, f"One sighting, one Escape — got {tails.count('Escape')}."
     assert tails[-1] == "Enter"
+
+
+_MCP_APPROVAL_DIALOG_PANE = """\
+────────────────────────────────────────────────────────────────────────────────
+  New MCP server found in this project: e2e-noop
+  MCP servers may execute code or access system resources. All tool calls
+  require approval. Learn more in the MCP documentation.
+    Use this MCP server
+    Use this and all future MCP servers in this project
+  ❯ Continue without using this MCP server
+  Enter to confirm · Esc to cancel
+"""
+
+_MCP_APPROVAL_CHECKLIST_PANE = """\
+────────────────────────────────────────────────────────────────────────────────
+  2 new MCP servers found in this project
+  Select any you wish to enable.
+  MCP servers may execute code or access system resources. All tool calls
+  require approval. Learn more in the MCP documentation.
+  ❯ [✔] srv0
+    [✔] srv1
+       Enable selected
+ Space to select · Esc to reject all
+"""
+
+_API_KEY_DIALOG_PANE = """\
+────────────────────────────────────────────────────────────────────────────────
+  Detected a custom API key in your environment
+  ANTHROPIC_API_KEY: sk-ant-...000000000000000000AA
+  Do you want to use this API key?
+    Yes
+  ❯ No (recommended)
+  Enter to confirm · Esc to cancel
+"""
+
+_TRUST_DIALOG_PANE = """\
+────────────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
+ /private/tmp/ws
+ Quick safety check: Is this a project you created or one you trust? (Like your
+ own code, a well-known open source project, or work from your team). If not,
+ take a moment to review what's in this folder first.
+ Claude Code'll be able to read, edit, and execute files here.
+ Security guide
+ ❯ No, exit
+   Yes, I trust this folder
+ Enter to confirm · Esc to cancel
+"""
+
+# The same dialog text scrolled into the transcript above a live input box.
+_DIALOG_ECHO_ABOVE_COMPOSER_PANE = _MCP_APPROVAL_DIALOG_PANE + _READY_PANE
+
+
+@pytest.mark.parametrize(
+    ("pane", "headline"),
+    [
+        (_MCP_APPROVAL_DIALOG_PANE, "New MCP server found in this project: e2e-noop"),
+        (_MCP_APPROVAL_CHECKLIST_PANE, "2 new MCP servers found in this project"),
+        (_API_KEY_DIALOG_PANE, "Detected a custom API key in your environment"),
+        (_TRUST_DIALOG_PANE, "Accessing workspace:"),
+    ],
+    ids=["mcp-single", "mcp-checklist", "api-key", "folder-trust"],
+)
+def test_terminal_dialog_headline_names_startup_dialogs(pane: str, headline: str) -> None:
+    """
+    Each real startup dialog is recognised by shape and named by its headline.
+
+    All four captures come from Claude Code 2.1.269. None of them is a mounted
+    input box, and each replaces the box with an option list under a
+    "Enter to … · Esc to …" footer, so the headline is what the web error
+    can show the person who has to answer it.
+    """
+    assert claude_native_bridge._terminal_dialog_headline(pane) == headline
+    assert _claude_prompt_rendered(pane) is False
+
+
+@pytest.mark.parametrize(
+    "pane",
+    [
+        _READY_PANE,
+        _BOOTING_PANE,
+        _IDLE_PANE,
+        _SHORTCUTS_PANEL_PANE,
+        _SHELL_MODE_PANE,
+        _SETTINGS_PANEL_PANE,
+        _PERMISSION_PROMPT_PANE,
+        _DIALOG_ECHO_ABOVE_COMPOSER_PANE,
+    ],
+    ids=[
+        "ready",
+        "booting",
+        "idle",
+        "shortcuts-panel",
+        "shell-mode",
+        "settings-panel",
+        "permission-prompt",
+        "dialog-echo-above-composer",
+    ],
+)
+def test_terminal_dialog_headline_ignores_other_panes(pane: str) -> None:
+    """
+    Nothing but a footer-bearing dialog without an input box reads as one.
+
+    A live composer wins even with dialog text scrolled above it; a booting
+    pane has no footer; the settings panel's "Esc to clear" is not a confirm
+    footer; and a boxed tool permission prompt has no footer at all, so it
+    stays on its own PermissionRequest path.
+    """
+    assert claude_native_bridge._terminal_dialog_headline(pane) is None
+
+
+def test_wait_for_claude_prompt_ready_fails_fast_on_a_terminal_dialog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A dialog holding the terminal fails the gate at once, not at the cap.
+
+    Before, the gate sat on the dialog for the 180 s slow-boot cap and raised
+    :class:`ClaudePromptTimeout`, which the executor answers by reaping the
+    pane. The dialog error is a different type on purpose, names the dialog,
+    tells the person what to do, and still carries the pane tail.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
+        lambda socket_path, tmux_target: _MCP_APPROVAL_DIALOG_PANE,
+    )
+    started = time.monotonic()
+    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog) as excinfo:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=30.0,
+        )
+    assert time.monotonic() - started < 5.0
+    assert not isinstance(excinfo.value, claude_native_bridge.ClaudePromptTimeout)
+    message = str(excinfo.value)
+    assert "New MCP server found in this project: e2e-noop" in message
+    assert "Open the terminal" in message
+    assert "answer the prompt" in message
+    assert "resend your message" in message
+    assert "Esc to cancel" in message
+
+
+def test_wait_for_claude_prompt_ready_ignores_a_single_dialog_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    One dialog-shaped frame is not enough; the composer on the next poll wins.
+
+    A single capture can misreport during a repaint, so the gate only fails
+    when two consecutive polls agree on the same dialog.
+    """
+    frames = iter([_MCP_APPROVAL_DIALOG_PANE, _READY_PANE])
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
+        lambda socket_path, tmux_target: next(frames, _READY_PANE),
+    )
+    claude_native_bridge._wait_for_claude_prompt_ready(
+        "/tmp/example/tmux.sock",
+        "claude:0.0",
+        timeout_s=30.0,
+    )
 
 
 @pytest.mark.parametrize(
@@ -10493,14 +10721,19 @@ def test_claude_pane_ready_is_true_only_at_an_idle_input_box(
 
     assert claude_native_bridge.claude_pane_ready(bridge_dir) is True
 
+    assert claude_native_bridge.claude_pane_text_ready(frames["pane"]) is True
+
     frames["pane"] = _MODEL_PICKER_PANE
     assert claude_native_bridge.claude_pane_ready(bridge_dir) is False
+    assert claude_native_bridge.claude_pane_text_ready(frames["pane"]) is False
 
     frames["pane"] = "  Switch model?\n"
     assert claude_native_bridge.claude_pane_ready(bridge_dir) is False
+    assert claude_native_bridge.claude_pane_text_ready(frames["pane"]) is False
 
     frames["pane"] = _EFFORT_DIALOG_PANE
     assert claude_native_bridge.claude_pane_ready(bridge_dir) is False
+    assert claude_native_bridge.claude_pane_text_ready(frames["pane"]) is False
 
 
 def test_claude_pane_ready_is_false_without_an_advertised_pane(tmp_path: Path) -> None:
@@ -11275,6 +11508,182 @@ def test_http_ingress_all_interfaces_opt_in_advertises_routable_host(
         assert info["url"] == f"http://203.0.113.9:{port}"
         with socket.create_connection(("127.0.0.1", port), timeout=5):
             pass
+        connection = claude_native_bridge._control_connection(info)
+        assert (connection.host, connection.port) == ("203.0.113.9", port)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+@pytest.fixture
+def _short_harness_socket_root(monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """Point the harness socket root at a short ``/tmp`` dir (``sun_path`` caps at 104 bytes)."""
+    with tempfile.TemporaryDirectory(prefix="og-mcp-", dir="/tmp") as root:
+        monkeypatch.setenv("OMNIGENT_HARNESS_TMP_PARENT", root)
+        yield Path(root)
+
+
+@pytest.mark.usefixtures("_no_ambient_bridge_network")
+def test_http_ingress_defaults_to_unix_socket(
+    tmp_path: Path, _short_harness_socket_root: Path
+) -> None:
+    """Without the bind-host override the control ingress opens no TCP port.
+
+    Remote-dev port forwarders mirror every loopback listener to the laptop
+    and cap how many they will, so the per-``serve-mcp`` control endpoint
+    lives on a Unix socket: ``post_tools_changed`` reaches it there, and
+    closing the server removes the socket file.
+    """
+    bridge_dir = prepare_bridge_dir("conv_ingress_uds", workspace=tmp_path)
+    notifications: queue.Queue[dict[str, object] | None] = queue.Queue()
+    httpd = claude_native_bridge._start_http_ingress(bridge_dir, "test-token", notifications)
+    try:
+        info = json.loads(
+            (bridge_dir / claude_native_bridge._SERVER_FILE).read_text(encoding="utf-8")
+        )
+        assert "url" not in info
+        socket_path = Path(info["socket"])
+        assert socket_path == _short_harness_socket_root / f"mcp-{os.getpid()}.sock"
+        assert socket_path.stat().st_mode & 0o777 == 0o600
+        post_tools_changed(bridge_dir, timeout_s=5.0)
+        assert notifications.get(timeout=5.0) == {
+            "jsonrpc": "2.0",
+            "method": "notifications/tools/list_changed",
+            "params": {},
+        }
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    assert not socket_path.exists()
+
+
+@pytest.mark.usefixtures("_no_ambient_bridge_network")
+def test_http_ingress_reaps_sockets_of_dead_owners(
+    tmp_path: Path, _short_harness_socket_root: Path
+) -> None:
+    """A killed pane leaves its ``serve-mcp`` socket behind; the next start reaps it by pid.
+
+    A socket whose owner is still alive belongs to another live session and stays.
+    """
+    exited = subprocess.Popen([sys.executable, "-c", ""])
+    exited.wait(timeout=30)
+    stale = _short_harness_socket_root / f"mcp-{exited.pid}.sock"
+    live = _short_harness_socket_root / f"mcp-{os.getppid()}.sock"
+    stale.touch()
+    live.touch()
+    bridge_dir = prepare_bridge_dir("conv_ingress_reap", workspace=tmp_path)
+    notifications: queue.Queue[dict[str, object] | None] = queue.Queue()
+    httpd = claude_native_bridge._start_http_ingress(bridge_dir, "test-token", notifications)
+    try:
+        assert not stale.exists()
+        assert live.exists()
+        assert (_short_harness_socket_root / f"mcp-{os.getpid()}.sock").exists()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+@pytest.mark.usefixtures("_no_ambient_bridge_network")
+def test_http_ingress_refuses_symlinked_socket_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _short_harness_socket_root: Path
+) -> None:
+    """A pre-created root that is a symlink is refused, not silently reused.
+
+    ``mkdir(exist_ok=True)`` would trust whatever another local user planted at
+    the socket root; the ingress validates it like a bridge ancestor instead.
+    """
+    real = _short_harness_socket_root / "real"
+    real.mkdir(mode=0o700)
+    link = _short_harness_socket_root / "link"
+    link.symlink_to(real)
+    monkeypatch.setenv("OMNIGENT_HARNESS_TMP_PARENT", str(link))
+    bridge_dir = prepare_bridge_dir("conv_ingress_symlink", workspace=tmp_path)
+    notifications: queue.Queue[dict[str, object] | None] = queue.Queue()
+    with pytest.raises(RuntimeError, match="is a symlink"):
+        claude_native_bridge._start_http_ingress(bridge_dir, "test-token", notifications)
+
+
+@pytest.mark.usefixtures("_no_ambient_bridge_network")
+def test_http_ingress_advertises_absolute_socket_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _short_harness_socket_root: Path
+) -> None:
+    """A relative, not-yet-created socket root is created and advertised absolute.
+
+    ``OMNIGENT_HARNESS_TMP_PARENT=.tmp/oa`` is a documented shape: nested under a
+    parent that may not exist yet, and relative to whatever directory
+    ``serve-mcp`` starts in. The runner reads ``server.json`` from its own working
+    directory, so the advertised path has to be absolute to resolve there.
+    """
+    relative_root = os.path.relpath(_short_harness_socket_root / "nested" / "oa")
+    assert not os.path.isabs(relative_root)
+    assert not (_short_harness_socket_root / "nested").exists()
+    monkeypatch.setenv("OMNIGENT_HARNESS_TMP_PARENT", relative_root)
+    bridge_dir = prepare_bridge_dir("conv_ingress_abs", workspace=tmp_path)
+    notifications: queue.Queue[dict[str, object] | None] = queue.Queue()
+    httpd = claude_native_bridge._start_http_ingress(bridge_dir, "test-token", notifications)
+    try:
+        info = json.loads(
+            (bridge_dir / claude_native_bridge._SERVER_FILE).read_text(encoding="utf-8")
+        )
+        assert Path(info["socket"]) == Path(os.path.abspath(relative_root)) / (
+            f"mcp-{os.getpid()}.sock"
+        )
+        elsewhere = tmp_path / "a" / "b" / "c" / "d"
+        elsewhere.mkdir(parents=True)
+        monkeypatch.chdir(elsewhere)
+        assert not Path(relative_root).exists()
+        post_tools_changed(bridge_dir, timeout_s=5.0)
+        assert notifications.get(timeout=5.0)["method"] == "notifications/tools/list_changed"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def _raw_unix_http_status(socket_path: Path, request: bytes) -> bytes:
+    """Send one pre-framed HTTP request over a Unix socket and return the status line."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(5)
+        sock.connect(str(socket_path))
+        sock.sendall(request)
+        return sock.recv(4096).split(b"\r\n", 1)[0]
+
+
+@pytest.mark.usefixtures("_no_ambient_bridge_network", "_short_harness_socket_root")
+def test_http_ingress_authenticates_before_draining_a_bounded_body(tmp_path: Path) -> None:
+    """A bad token is refused before any body is read, and an oversized body is refused.
+
+    ``Content-Length`` is caller-controlled, so the drain that keeps the real
+    client off EPIPE must not become a way to occupy the server with bytes.
+    """
+    bridge_dir = prepare_bridge_dir("conv_ingress_auth", workspace=tmp_path)
+    notifications: queue.Queue[dict[str, object] | None] = queue.Queue()
+    httpd = claude_native_bridge._start_http_ingress(bridge_dir, "test-token", notifications)
+    try:
+        socket_path = Path(
+            json.loads(
+                (bridge_dir / claude_native_bridge._SERVER_FILE).read_text(encoding="utf-8")
+            )["socket"]
+        )
+        # Declare a body but withhold it: a handler that drained before
+        # authenticating would block here instead of answering 401.
+        unauthorized_headers_only = (
+            b"POST /tools-changed HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer wrong\r\n"
+            b"Content-Length: 2\r\n\r\n"
+        )
+        assert (
+            _raw_unix_http_status(socket_path, unauthorized_headers_only)
+            == b"HTTP/1.0 401 Unauthorized"
+        )
+        oversized_body = b"x" * (claude_native_bridge._TOOLS_CHANGED_BODY_MAX_BYTES + 1)
+        oversized = (
+            b"POST /tools-changed HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer test-token\r\n"
+            + f"Content-Length: {len(oversized_body)}\r\n\r\n".encode()
+            + oversized_body
+        )
+        assert _raw_unix_http_status(socket_path, oversized) == (
+            b"HTTP/1.0 413 Request Entity Too Large"
+        )
+        assert notifications.empty()
     finally:
         httpd.shutdown()
         httpd.server_close()
