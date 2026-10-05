@@ -409,7 +409,7 @@ class TestConstructor(unittest.TestCase):
         from omnigent.spec.types import RetryPolicy
 
         with patch.dict("os.environ"):
-            os.environ.pop("CLAUDE_CODE_ENTRYPOINT", None)
+            os.environ.pop("OMNIGENT_CLAUDE_CODE_ENTRYPOINT", None)
             executor = ClaudeSDKExecutor()
         self.assertFalse(executor._os_env)
         self.assertIsNone(executor._os_env_spec)
@@ -722,7 +722,7 @@ class TestConstructor(unittest.TestCase):
         from omnigent.spec.types import RetryPolicy
 
         with patch.dict("os.environ"):
-            os.environ.pop("CLAUDE_CODE_ENTRYPOINT", None)
+            os.environ.pop("OMNIGENT_CLAUDE_CODE_ENTRYPOINT", None)
             executor = ClaudeSDKExecutor(gateway=False)
         # gateway=False → no Databricks env, but Tool Search and RetryPolicy
         # CLI env are always merged in.
@@ -1122,15 +1122,15 @@ class TestConstructor(unittest.TestCase):
         _run(_t())
 
     def test_claude_code_entrypoint_is_forwarded_when_set(self):
-        """``CLAUDE_CODE_ENTRYPOINT`` from the host env lands in the CLI env."""
+        """``OMNIGENT_CLAUDE_CODE_ENTRYPOINT`` is sent to the CLI as ``CLAUDE_CODE_ENTRYPOINT``."""
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
-        with patch.dict("os.environ", {"CLAUDE_CODE_ENTRYPOINT": "cli"}):
+        with patch.dict("os.environ", {"OMNIGENT_CLAUDE_CODE_ENTRYPOINT": "cli"}):
             executor = ClaudeSDKExecutor(model="claude-sonnet-4-5")
         self.assertEqual(executor._extra_env["CLAUDE_CODE_ENTRYPOINT"], "cli")
 
         with patch.dict("os.environ"):
-            os.environ.pop("CLAUDE_CODE_ENTRYPOINT", None)
+            os.environ.pop("OMNIGENT_CLAUDE_CODE_ENTRYPOINT", None)
             executor = ClaudeSDKExecutor(model="claude-sonnet-4-5")
         self.assertNotIn("CLAUDE_CODE_ENTRYPOINT", executor._extra_env)
 
