@@ -1789,6 +1789,8 @@ class ClaudeSDKExecutor(Executor):
                 )
             self._extra_env.update(gateway_env)
         self._extra_env[_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV] = "true"
+        if entrypoint := os.environ.get("CLAUDE_CODE_ENTRYPOINT"):
+            self._extra_env["CLAUDE_CODE_ENTRYPOINT"] = entrypoint
 
         # Retry policy → Anthropic SDK env vars passed to the Claude
         # CLI subprocess. ``ANTHROPIC_MAX_RETRIES`` and
@@ -2589,8 +2591,6 @@ class ClaudeSDKExecutor(Executor):
         # ``_get_or_create_client`` via ``_unset_env_var`` — setting it to
         # ``""`` here would still leave an empty key in the child env.
         env = dict(self._extra_env)
-        if entrypoint := os.environ.get("CLAUDE_CODE_ENTRYPOINT"):
-            env.setdefault("CLAUDE_CODE_ENTRYPOINT", entrypoint)
         api_key_helper = env.pop(_CLAUDE_API_KEY_HELPER_ENV_KEY, None)
         # Teach Claude Code this gateway's spellings so no model surface routes
         # to an id the gateway rejects: pins for the family aliases, rewrites

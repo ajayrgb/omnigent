@@ -408,7 +408,9 @@ class TestConstructor(unittest.TestCase):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
         from omnigent.spec.types import RetryPolicy
 
-        executor = ClaudeSDKExecutor()
+        with patch.dict("os.environ"):
+            os.environ.pop("CLAUDE_CODE_ENTRYPOINT", None)
+            executor = ClaudeSDKExecutor()
         self.assertFalse(executor._os_env)
         self.assertIsNone(executor._os_env_spec)
         self.assertIsNone(executor._cwd)
@@ -719,7 +721,9 @@ class TestConstructor(unittest.TestCase):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
         from omnigent.spec.types import RetryPolicy
 
-        executor = ClaudeSDKExecutor(gateway=False)
+        with patch.dict("os.environ"):
+            os.environ.pop("CLAUDE_CODE_ENTRYPOINT", None)
+            executor = ClaudeSDKExecutor(gateway=False)
         # gateway=False → no Databricks env, but Tool Search and RetryPolicy
         # CLI env are always merged in.
         self.assertEqual(
@@ -1118,31 +1122,17 @@ class TestConstructor(unittest.TestCase):
         _run(_t())
 
     def test_claude_code_entrypoint_is_forwarded_when_set(self):
-        """``CLAUDE_CODE_ENTRYPOINT`` from the host env reaches the SDK options env."""
+        """``CLAUDE_CODE_ENTRYPOINT`` from the host env lands in the CLI env."""
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
-        async def _t(set_it: bool):
+        with patch.dict("os.environ", {"CLAUDE_CODE_ENTRYPOINT": "cli"}):
             executor = ClaudeSDKExecutor(model="claude-sonnet-4-5")
-            captured: dict[str, dict[str, str]] = {}
+        self.assertEqual(executor._extra_env["CLAUDE_CODE_ENTRYPOINT"], "cli")
 
-            async def fake_get_or_create_client(sdk, *, session_key, options, model):
-                captured["env"] = dict(options.env or {})
-                raise RuntimeError("stop after env assembly")
-
-            env_patch = {"CLAUDE_CODE_ENTRYPOINT": "cli"} if set_it else {}
-            with (
-                patch.dict("os.environ", env_patch),
-                patch.object(executor, "_get_or_create_client", side_effect=fake_get_or_create_client),
-            ):
-                if not set_it:
-                    os.environ.pop("CLAUDE_CODE_ENTRYPOINT", None)
-                with self.assertRaises(RuntimeError):
-                    async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
-                        pass
-            return captured["env"]
-
-        self.assertEqual(_run(_t(True)).get("CLAUDE_CODE_ENTRYPOINT"), "cli")
-        self.assertNotIn("CLAUDE_CODE_ENTRYPOINT", _run(_t(False)))
+        with patch.dict("os.environ"):
+            os.environ.pop("CLAUDE_CODE_ENTRYPOINT", None)
+            executor = ClaudeSDKExecutor(model="claude-sonnet-4-5")
+        self.assertNotIn("CLAUDE_CODE_ENTRYPOINT", executor._extra_env)
 
     def test_explicit_family_pins_are_not_overwritten(self):
         """Pre-set ``ANTHROPIC_DEFAULT_*_MODEL`` pins win over the listing.
