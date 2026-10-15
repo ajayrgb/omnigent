@@ -1454,9 +1454,16 @@ def test_credential_proxy_aws_sigv4_signs_boto3_put_object(
     from botocore.awsrequest import AWSRequest
     from botocore.credentials import Credentials as BotocoreCredentials
 
+    # Sign at the captured request's own timestamp: this runs after
+    # teardown, so "now" may have crossed a second boundary.
+    amz_date = headers["x-amz-date"]
+
     class _NoRehashS3SigV4Auth(S3SigV4Auth):  # type: ignore[misc]
         def _modify_request_before_signing(self, request: object) -> None:
             SigV4Auth._modify_request_before_signing(self, request)
+            del request.headers["X-Amz-Date"]  # type: ignore[attr-defined]
+            request.headers["X-Amz-Date"] = amz_date  # type: ignore[attr-defined]
+            request.context["timestamp"] = amz_date  # type: ignore[attr-defined]
 
     managed = {"authorization", "x-amz-date", "date", "x-amz-security-token"}
     filtered_headers = {k: v for k, v in headers.items() if k not in managed}

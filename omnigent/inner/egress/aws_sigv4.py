@@ -151,8 +151,11 @@ def resign_request(
     from botocore.awsrequest import AWSRequest
     from botocore.credentials import Credentials
 
-    class _PreserveContentSha256S3SigV4Auth(S3SigV4Auth):  # type: ignore[misc]
-        """``S3SigV4Auth`` that leaves ``X-Amz-Content-Sha256`` untouched.
+    # S3 keys are signed without path normalization; other services use ordinary SigV4.
+    base_auth = S3SigV4Auth if service == "s3" else SigV4Auth
+
+    class _PreserveContentSha256Auth(base_auth):  # type: ignore[misc, valid-type]
+        """Signer that leaves ``X-Amz-Content-Sha256`` untouched.
 
         ``S3SigV4Auth._modify_request_before_signing`` unconditionally
         deletes and recomputes ``X-Amz-Content-Sha256`` from
@@ -169,23 +172,19 @@ def resign_request(
         def _modify_request_before_signing(self, request: object) -> None:
             SigV4Auth._modify_request_before_signing(self, request)  # type: ignore[missing-attribute]
 
-    filtered_headers = {
-        name: value
-        for name, value in headers.items()
-        if name.lower() not in {h.lower() for h in _AUTH_MANAGED_HEADERS}
-    }
-    aws_request = AWSRequest(method=method, url=url, data=body, headers=filtered_headers)
+    # Keep a Message (not a dict) so repeated headers sign as forwarded.
+    resigned = copy.deepcopy(headers)
+    for name in _AUTH_MANAGED_HEADERS:
+        del resigned[name]
+    aws_request = AWSRequest(method=method, url=url, data=body, headers=resigned)
     signing_credentials = Credentials(
         credentials.access_key_id,
         credentials.secret_access_key,
         credentials.session_token,
     )
-    signer = _PreserveContentSha256S3SigV4Auth(signing_credentials, service, region)
+    signer = _PreserveContentSha256Auth(signing_credentials, service, region)
     signer.add_auth(aws_request)
 
-    resigned = copy.deepcopy(headers)
-    for name in _AUTH_MANAGED_HEADERS:
-        del resigned[name]
     for name in _AUTH_MANAGED_HEADERS:
         value = aws_request.headers.get(name)
         if value is not None:

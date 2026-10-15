@@ -40,7 +40,7 @@ from email.message import Message
 from email.parser import BytesParser
 from pathlib import Path
 from typing import cast
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 from omnigent.inner.credential_proxy import (
     SYNTHETIC_CREDENTIAL_PREFIX,
@@ -691,10 +691,7 @@ class EgressProxy:
                 )
                 return
 
-            content_length = int(inner_headers.get("content-length", "0"))
-            body = b""
-            if content_length > 0:
-                body = await asyncio.wait_for(tls_reader.readexactly(content_length), timeout=30)
+            body = await asyncio.wait_for(self._read_body(tls_reader, inner_headers), timeout=30)
 
             await self._forward_https(
                 tls_writer,
@@ -796,6 +793,34 @@ class EgressProxy:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(upstream_writer.wait_closed(), timeout=2)
 
+    @staticmethod
+    async def _read_body(reader: asyncio.StreamReader, headers: dict[str, str]) -> bytes:
+        """
+        Read a request body, returning the bytes exactly as sent on the wire.
+
+        ``Transfer-Encoding: chunked`` bodies (boto3's default HTTPS upload
+        shape) are returned with their chunk framing intact, since the
+        forwarded headers still declare it.
+
+        :param reader: Stream positioned just after the header block.
+        :param headers: Lower-cased request header dict.
+        :returns: The raw body bytes, ``b""`` when the request has none.
+        """
+        if "chunked" in headers.get("transfer-encoding", "").lower():
+            raw = b""
+            while True:
+                size_line = await reader.readline()
+                raw += size_line
+                size = int(size_line.split(b";")[0].strip() or b"0", 16)
+                if size == 0:
+                    break
+                raw += await reader.readexactly(size + 2)
+            while (line := await reader.readline()) not in (b"\r\n", b"\n", b""):
+                raw += line  # trailers
+            return raw + b"\r\n"
+        content_length = int(headers.get("content-length", "0"))
+        return await reader.readexactly(content_length) if content_length > 0 else b""
+
     async def _forward_https(
         self,
         client_writer: asyncio.StreamWriter,
@@ -844,9 +869,16 @@ class EgressProxy:
         # enforced), so at most one of the two rewrite calls ever does
         # real work; the other is a cheap no-op passthrough.
         sigv4_rewrite = await self._resign_aws_sigv4_async(
-            method=method, host=host, path=path, headers_raw=rewrite.headers, body=body
+            method=method,
+            host=host,
+            path=path,
+            headers_raw=self._force_connection_close(rewrite.headers),
+            body=body,
         )
         if sigv4_rewrite.error is not None:
+            if sigv4_rewrite.status_code == 502:
+                await self._send_bad_gateway(client_writer, sigv4_rewrite.error)
+                return
             logger.warning(
                 "BLOCKED-CREDENTIAL %s https://%s%s — %s", method, host, path, sigv4_rewrite.error
             )
@@ -856,7 +888,7 @@ class EgressProxy:
         # instead of blocking on a keep-alive socket — and so pipelining
         # clients (git's libcurl) don't stall waiting to reuse a tunnel the
         # proxy only services once. See ``_force_connection_close``.
-        headers_raw = self._force_connection_close(sigv4_rewrite.headers)
+        headers_raw = sigv4_rewrite.headers
         try:
             upstream_reader, upstream_writer = await asyncio.wait_for(
                 asyncio.open_connection(
@@ -992,10 +1024,7 @@ class EgressProxy:
             return
 
         inner_headers = self._parse_header_dict(headers_raw)
-        content_length = int(inner_headers.get("content-length", "0"))
-        body = b""
-        if content_length > 0:
-            body = await asyncio.wait_for(reader.readexactly(content_length), timeout=30)
+        body = await asyncio.wait_for(self._read_body(reader, inner_headers), timeout=30)
 
         relative_line = f"{method} {path} HTTP/1.1\r\n".encode("latin-1")
         rewrite = await self._rewrite_authorization_async(
@@ -1014,9 +1043,16 @@ class EgressProxy:
         # enforced), so at most one of the two rewrite calls ever does
         # real work; the other is a cheap no-op passthrough.
         sigv4_rewrite = await self._resign_aws_sigv4_async(
-            method=method, host=host, path=path, headers_raw=rewrite.headers, body=body
+            method=method,
+            host=host,
+            path=path,
+            headers_raw=self._force_connection_close(rewrite.headers),
+            body=body,
         )
         if sigv4_rewrite.error is not None:
+            if sigv4_rewrite.status_code == 502:
+                await self._send_bad_gateway(writer, sigv4_rewrite.error)
+                return
             logger.warning(
                 "BLOCKED-CREDENTIAL %s http://%s%s — %s", method, host, path, sigv4_rewrite.error
             )
@@ -1024,7 +1060,7 @@ class EgressProxy:
             return
         # Single-shot the upstream (prompt EOF for the relay, no stalled
         # tunnel reuse). See ``_force_connection_close``.
-        headers_raw = self._force_connection_close(sigv4_rewrite.headers)
+        headers_raw = sigv4_rewrite.headers
 
         # Connect to the IP pinned by the destination check (or the
         # hostname when blocking is disabled and ``pinned_ip`` is
@@ -1518,13 +1554,28 @@ class EgressProxy:
         existing = msg.get("Authorization")
         if existing is None or not aws_sigv4.is_sigv4_authorization(existing):
             return _AuthRewriteResult(headers=headers_raw, error=None)
+        # botocore signs the Host header over the URL host; refuse a sandbox-chosen authority.
+        if any(
+            urlsplit(f"//{value.strip()}").hostname != host.lower()
+            for value in msg.get_all("Host", [])
+        ):
+            return _AuthRewriteResult(
+                headers=b"", error="Host header does not match the credential-bound host"
+            )
+        try:
+            credentials = rule.resolve_credentials()
+        except Exception:  # noqa: BLE001 — any provider failure (STS, expired SSO) maps to 502
+            logger.warning("CREDENTIAL-REFRESH-FAILED %s %s", method, host)
+            return _AuthRewriteResult(
+                headers=b"", error="Credential source unavailable", status_code=502
+            )
         try:
             resigned = aws_sigv4.resign_request(
                 method=method,
                 url=f"https://{host}{path}",
                 headers=msg,
                 body=body,
-                credentials=rule.resolve_credentials(),
+                credentials=credentials,
                 region=rule.region,
                 service=rule.service,
             )

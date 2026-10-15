@@ -2983,6 +2983,104 @@ async def test_aws_sigv4_rejects_presigned_query_auth(
 
 
 @pytest.mark.asyncio
+async def test_aws_sigv4_credential_provider_failure_returns_502(
+    ca_paths: tuple[Path, Path, Path],
+) -> None:
+    """A failing credential provider (STS, expired SSO) yields a 502, not a torn connection."""
+    cert_path, key_path, _ = ca_paths
+
+    def failing_provider() -> AwsSigV4Credentials:
+        raise RuntimeError("sso session expired")
+
+    rule = AwsSigV4RewriteRule(
+        host="127.0.0.1", region="us-east-1", service="s3", credential_provider=failing_provider
+    )
+    captured: list[_CapturedRequest] = []
+    upstream = await _start_capturing_upstream(captured)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+    proxy = EgressProxy(
+        parse_rules(["* 127.0.0.1/**"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+        aws_sigv4_rewrites=[rule],
+    )
+    proxy_port = await proxy.start_tcp()
+    try:
+        response = await _proxied_http_request_with_body(
+            proxy_port=proxy_port,
+            upstream_port=upstream_port,
+            method="GET",
+            headers={"Authorization": "AWS4-HMAC-SHA256 Credential=x/us-east-1/s3/aws4_request"},
+            body=b"",
+        )
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+    assert b"502" in response
+    assert b"Credential source unavailable" in response
+    assert b"sso session expired" not in response
+    assert len(captured) == 0
+
+
+@pytest.mark.asyncio
+async def test_aws_sigv4_rejects_host_header_not_bound_to_rule(
+    ca_paths: tuple[Path, Path, Path],
+) -> None:
+    """The signer never authenticates a sandbox-chosen Host: mismatch -> 403, no upstream hit."""
+    cert_path, key_path, _ = ca_paths
+    rule = AwsSigV4RewriteRule(
+        host="127.0.0.1",
+        region="us-east-1",
+        service="s3",
+        static_credentials=AwsSigV4Credentials(_REAL_ACCESS_KEY_ID, _REAL_SECRET_ACCESS_KEY),
+    )
+    captured: list[_CapturedRequest] = []
+    upstream = await _start_capturing_upstream(captured)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+    proxy = EgressProxy(
+        parse_rules(["* 127.0.0.1/**"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+        aws_sigv4_rewrites=[rule],
+    )
+    proxy_port = await proxy.start_tcp()
+    try:
+        response = await _proxied_http_request_with_body(
+            proxy_port=proxy_port,
+            upstream_port=upstream_port,
+            method="GET",
+            headers={
+                "Host": "other-bucket.example.com",
+                "Authorization": "AWS4-HMAC-SHA256 Credential=x/us-east-1/s3/aws4_request",
+            },
+            body=b"",
+        )
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+    assert b"403" in response
+    assert len(captured) == 0
+
+
+@pytest.mark.asyncio
+async def test_read_body_keeps_chunked_framing_and_trailers() -> None:
+    """boto3's default HTTPS upload has no Content-Length; the body must still be read in full."""
+    wire = b"5\r\nhello\r\n6;ext=1\r\n world\r\n0\r\nx-amz-checksum-crc32: abc\r\n\r\n"
+    reader = asyncio.StreamReader()
+    reader.feed_data(wire + b"NEXT")
+    reader.feed_eof()
+    body = await EgressProxy._read_body(reader, {"transfer-encoding": "chunked"})
+    assert body == wire
+    assert await reader.read() == b"NEXT"
+
+
+@pytest.mark.asyncio
 async def test_aws_sigv4_passes_through_non_sigv4_authorization_unchanged(
     ca_paths: tuple[Path, Path, Path],
 ) -> None:

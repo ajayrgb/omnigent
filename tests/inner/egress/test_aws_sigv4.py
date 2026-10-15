@@ -198,3 +198,54 @@ def test_is_sigv4_authorization(value: str, expected: bool) -> None:
 )
 def test_has_presigned_query_auth(query: str, expected: bool) -> None:
     assert has_presigned_query_auth(query) is expected
+
+
+def _reference_sigv4(url: str, header_pairs: list[tuple[str, str]], service: str) -> str:
+    """Sign with plain botocore ``SigV4Auth`` (ordinary rules), headers appended as sent."""
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    request = AWSRequest(method="GET", url=url, data=b"")
+    for name, value in header_pairs:
+        request.headers.add_header(name, value)
+    SigV4Auth(Credentials("AKIDREAL", "realsecret"), service, "us-east-1").add_auth(request)
+    return request.headers["Authorization"]
+
+
+@pytest.mark.parametrize(
+    "service,url,pairs",
+    [
+        # Non-S3 services canonicalize the path with ordinary SigV4 rules.
+        (
+            "execute-api",
+            "https://api.example.com/prod/items/hello%20world",
+            [("Host", "api.example.com")],
+        ),
+        # Repeated headers sign as the comma-joined value that gets forwarded.
+        (
+            "execute-api",
+            "https://api.example.com/prod",
+            [("Host", "api.example.com"), ("x-amz-meta-a", "1"), ("x-amz-meta-a", "2")],
+        ),
+    ],
+)
+def test_resign_matches_ordinary_sigv4(
+    pinned_clock, service: str, url: str, pairs: list[tuple[str, str]]
+) -> None:
+    pinned_clock(datetime.datetime(2013, 5, 24, tzinfo=datetime.timezone.utc))
+    headers = _headers({})
+    for name, value in pairs:
+        headers.add_header(name, value)
+
+    result = resign_request(
+        method="GET",
+        url=url,
+        headers=headers,
+        body=b"",
+        credentials=AwsSigV4Credentials("AKIDREAL", "realsecret"),
+        region="us-east-1",
+        service=service,
+    )
+
+    assert result["Authorization"] == _reference_sigv4(url, pairs, service)
