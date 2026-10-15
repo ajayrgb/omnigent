@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 
 import pytest
 from playwright.sync_api import Locator, Page, Route, expect
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from tests.browser_ui.conftest import BrowserContract
 
@@ -130,6 +131,9 @@ def seeded_session(browser_contract: BrowserContract) -> BrowserSession:
         },
     )
     browser_contract.json(f"{api}/child_sessions", empty)
+    browser_contract.json(f"{api}/policies", empty)
+    browser_contract.json("/v1/policy-registry", empty)
+    browser_contract.json(f"{api}/owner", {"owner": None})
     browser_contract.response(f"{api}/read-state", method="PUT")
     browser_contract.json(
         f"{api}/resources/environments/default", {"metadata": {"root": "/workspace"}}
@@ -323,6 +327,113 @@ def _seed_citation_file(
     )
 
 
+def test_diff_loads_in_parallel_with_workspace_metadata(
+    page: Page, seeded_session: BrowserSession
+) -> None:
+    path = "src/new-notes.md"
+    content = "# New notes\n\nA small newly created markdown file.\n"
+    _mock_markdown_files(page, seeded_session, {path: content})
+    base_url, session_id = seeded_session
+    environment_url = f"{base_url}/v1/sessions/{session_id}/resources/environments/default"
+    pending_metadata: list[Route] = []
+    pending_diff: list[Route] = []
+    seeded_session.contract.route(environment_url, lambda route: pending_metadata.append(route))
+    seeded_session.contract.route(
+        f"{environment_url}/diff/{path}", lambda route: pending_diff.append(route)
+    )
+    seeded_session.contract.json(
+        f"/v1/sessions/{session_id}/resources/environments/default/changes",
+        {"object": "list", "data": [{"path": path, "name": path, "status": "created"}]},
+    )
+    page.set_viewport_size({"width": 1600, "height": 1000})
+    try:
+        with (
+            page.expect_request(environment_url, timeout=10_000),
+            page.expect_request(f"{environment_url}/diff/{path}", timeout=10_000),
+        ):
+            page.goto(f"{base_url}/c/{session_id}?file={path}&diff=1")
+        # The editor code can load while both API responses are still held.
+        page.wait_for_function("() => !!window.MonacoEnvironment", timeout=10_000)
+        expect(page.locator(".monaco-diff-editor")).to_have_count(0)
+        assert pending_metadata
+        assert pending_diff
+    finally:
+        for route in pending_metadata:
+            route.fulfill(json={"metadata": {"root": "/workspace"}})
+        for route in pending_diff:
+            route.fulfill(
+                json={
+                    "object": "session.environment.filesystem.file_diff",
+                    "path": path,
+                    "before": None,
+                    "after": content,
+                }
+            )
+    expect(page.locator(".monaco-diff-editor")).to_have_count(1)
+    expect(page.locator(".monaco-diff-editor .line-insert").first).to_be_visible()
+    expect(page).to_have_url(re.compile(r"[?&]diff=1(?:&|$)"))
+
+
+@pytest.mark.parametrize("initial_width", [1600, 390])
+def test_diff_computes_once_per_viewport(
+    page: Page, seeded_session: BrowserSession, initial_width: int
+) -> None:
+    """Only the visible responsive viewer mounts Monaco and computes the diff."""
+    _seed_citation_file(page, seeded_session)
+    page.add_init_script(
+        """(() => {
+          window.diffComputations = [];
+          const NativeWorker = window.Worker;
+          window.Worker = class extends NativeWorker {
+            constructor(...args) {
+              super(...args);
+              this.pendingDiffs = new Map();
+              this.addEventListener('message', ({data}) => {
+                const computation = this.pendingDiffs.get(data?.seq);
+                if (computation) {
+                  computation.completed = true;
+                  this.pendingDiffs.delete(data.seq);
+                }
+              });
+            }
+            postMessage(message, ...rest) {
+              if (message?.method === '$computeDiff') {
+                const computation = {completed: false};
+                window.diffComputations.push(computation);
+                this.pendingDiffs.set(message.req, computation);
+              }
+              return super.postMessage(message, ...rest);
+            }
+          };
+        })();"""
+    )
+    page.set_viewport_size({"width": initial_width, "height": 1000})
+    base_url, session_id = seeded_session
+    page.goto(f"{base_url}/c/{session_id}?file={_FILE_PATH}&diff=1")
+
+    other_width = 390 if initial_width == 1600 else 1600
+    for expected_count, width in enumerate((initial_width, other_width, initial_width), 1):
+        page.set_viewport_size({"width": width, "height": 1000})
+        # Count all editors, including CSS-hidden ones.
+        editors = page.locator(".monaco-diff-editor")
+        expect(editors).to_have_count(1, timeout=30_000)
+        expect(editors).to_be_visible()
+        try:
+            page.wait_for_function(
+                """count => window.diffComputations.length >= count &&
+                  window.diffComputations.every(computation => computation.completed)""",
+                arg=expected_count,
+            )
+        except PlaywrightTimeoutError:
+            pytest.fail(
+                f"Expected {expected_count} completed diff computations; observed "
+                f"{page.evaluate('window.diffComputations')}. "
+                "Instrumentation depends on Monaco worker $computeDiff/req/seq RPC fields."
+            )
+        assert page.evaluate("window.diffComputations.length") == expected_count
+        expect(page).to_have_url(re.compile(r"[?&]diff=1(?:&|$)"))
+
+
 @pytest.mark.parametrize("layout", ["split", "unified"])
 def test_chat_line_link_expands_and_centers_diff_context(
     page: Page,
@@ -385,7 +496,11 @@ def test_source_citation_centers_last_loaded_line(
       )[0].textContent.replace(/\u00a0/g, ' ');
     }""")
     page.get_by_role("button", name="Collapse right panel").click()
-    expect(viewer).to_have_count(0)
+    # The rail stays mounted at width 0 so its 300ms exit can finish without
+    # remounting the editor. Pin the closed rail state instead of expecting
+    # the viewer subtree to disappear.
+    rail = page.locator('aside[aria-label="Workspace"]')
+    expect(rail).to_have_attribute("data-state", "closed")
     page.get_by_role("button", name="Expand right panel").click()
     page.wait_for_function(
         _CENTERED_LINE, arg={"text": centered_text, "diff": False}, timeout=30_000
