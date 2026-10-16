@@ -1966,8 +1966,7 @@ async def _start_capturing_upstream(
                 connection.append(line.partition(b":")[2].strip().decode("latin-1").lower())
             elif line[:13].lower() == b"max-forwards:":
                 max_forwards = line.partition(b":")[2].strip().decode("latin-1")
-        content_length = int(headers.get("content-length", "0") or "0")
-        body = await reader.readexactly(content_length) if content_length else b""
+        body = await EgressProxy._read_body(reader, headers)  # raw wire bytes, chunk framing kept
         captured.append(
             _CapturedRequest(
                 authorization=auth,
@@ -2087,11 +2086,16 @@ async def _proxied_http_request_with_body(
     """
     reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
     header_lines = "".join(f"{name}: {value}\r\n" for name, value in headers.items())
+    framing = (
+        ""
+        if "transfer-encoding" in {k.lower() for k in headers}
+        else f"Content-Length: {len(body)}\r\n"
+    )
     request = (
         f"{method} http://127.0.0.1:{upstream_port}{path} HTTP/1.1\r\n"
         f"Host: 127.0.0.1:{upstream_port}\r\n"
         f"{header_lines}"
-        f"Content-Length: {len(body)}\r\n"
+        f"{framing}"
         "Connection: close\r\n"
         "\r\n"
     ).encode("latin-1") + body
@@ -3065,6 +3069,123 @@ async def test_aws_sigv4_rejects_host_header_not_bound_to_rule(
         await upstream.wait_closed()
 
     assert b"403" in response
+    assert len(captured) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "headers,wire",
+    [
+        ({"transfer-encoding": "chunked"}, b"zz\r\nhi\r\n0\r\n\r\n"),  # non-hex size
+        ({"transfer-encoding": "chunked"}, b"1_0\r\n" + b"x" * 16 + b"\r\n0\r\n\r\n"),
+        ({"transfer-encoding": "chunked"}, b"-5\r\nhello\r\n0\r\n\r\n"),
+        ({"transfer-encoding": "chunked"}, b"2\r\nhiXX0\r\n\r\n"),  # missing chunk CRLF
+        ({"transfer-encoding": "chunked"}, b"5\r\nhel"),  # truncated
+        ({"transfer-encoding": "chunked"}, b"0\r\n"),  # EOF before trailer end
+        ({"transfer-encoding": "xchunked"}, b"0\r\n\r\n"),
+        ({"transfer-encoding": "chunked", "content-length": "5"}, b"0\r\n\r\n"),
+        ({"content-length": "abc"}, b""),
+        ({"content-length": "-1"}, b""),
+        ({"content-length": str(10**12)}, b""),
+    ],
+)
+async def test_read_body_rejects_malformed_framing(headers: dict[str, str], wire: bytes) -> None:
+    reader = asyncio.StreamReader()
+    reader.feed_data(wire)
+    reader.feed_eof()
+    with pytest.raises((ValueError, asyncio.IncompleteReadError)):
+        await EgressProxy._read_body(reader, headers)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "host_header",
+    ["evil@127.0.0.1", "[127.0.0.1"],
+)
+async def test_aws_sigv4_rejects_host_header_with_userinfo_or_garbage(
+    ca_paths: tuple[Path, Path, Path], host_header: str
+) -> None:
+    """Odd Host shapes get a clean 403 (no exception, nothing signed or forwarded)."""
+    cert_path, key_path, _ = ca_paths
+    rule = AwsSigV4RewriteRule(
+        host="127.0.0.1",
+        region="us-east-1",
+        service="s3",
+        static_credentials=AwsSigV4Credentials(_REAL_ACCESS_KEY_ID, _REAL_SECRET_ACCESS_KEY),
+    )
+    captured: list[_CapturedRequest] = []
+    upstream = await _start_capturing_upstream(captured)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+    proxy = EgressProxy(
+        parse_rules(["* 127.0.0.1/**"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+        aws_sigv4_rewrites=[rule],
+    )
+    proxy_port = await proxy.start_tcp()
+    try:
+        response = await _proxied_http_request_with_body(
+            proxy_port=proxy_port,
+            upstream_port=upstream_port,
+            method="GET",
+            headers={
+                "Host": host_header,
+                "Authorization": "AWS4-HMAC-SHA256 Credential=x/us-east-1/s3/aws4_request",
+            },
+            body=b"",
+        )
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+    assert b"403" in response
+    assert len(captured) == 0
+
+
+@pytest.mark.asyncio
+async def test_aws_sigv4_signing_failure_returns_502(
+    ca_paths: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unexpected signing error (e.g. botocore blowup) is a 502, not a torn connection."""
+    cert_path, key_path, _ = ca_paths
+
+    def boom(**_: object) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("omnigent.inner.egress.aws_sigv4.resign_request", boom)
+    rule = AwsSigV4RewriteRule(
+        host="127.0.0.1",
+        region="us-east-1",
+        service="s3",
+        static_credentials=AwsSigV4Credentials(_REAL_ACCESS_KEY_ID, _REAL_SECRET_ACCESS_KEY),
+    )
+    captured: list[_CapturedRequest] = []
+    upstream = await _start_capturing_upstream(captured)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+    proxy = EgressProxy(
+        parse_rules(["* 127.0.0.1/**"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+        aws_sigv4_rewrites=[rule],
+    )
+    proxy_port = await proxy.start_tcp()
+    try:
+        response = await _proxied_http_request_with_body(
+            proxy_port=proxy_port,
+            upstream_port=upstream_port,
+            method="GET",
+            headers={"Authorization": "AWS4-HMAC-SHA256 Credential=x/us-east-1/s3/aws4_request"},
+            body=b"",
+        )
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+    assert b"502" in response
     assert len(captured) == 0
 
 

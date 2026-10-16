@@ -32,6 +32,7 @@ import functools
 import hmac
 import ipaddress
 import logging
+import re
 import socket
 import ssl
 from collections.abc import Callable
@@ -40,7 +41,7 @@ from email.message import Message
 from email.parser import BytesParser
 from pathlib import Path
 from typing import cast
-from urllib.parse import urlparse, urlsplit
+from urllib.parse import urlparse
 
 from omnigent.inner.credential_proxy import (
     SYNTHETIC_CREDENTIAL_PREFIX,
@@ -154,6 +155,11 @@ _CLOUD_TRAP_NETWORKS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] 
     # See: https://learn.microsoft.com/en-us/azure/virtual-network/what-is-ip-address-168-63-129-16
     ipaddress.ip_network("168.63.129.16/32"),
 )
+
+
+# Request bodies are buffered whole (they are re-signed); cap what the sandbox can make us hold.
+_MAX_BODY_BYTES = 256 * 1024 * 1024
+_CHUNK_SIZE_LINE = re.compile(rb"([0-9A-Fa-f]{1,16})(?:;[^\r\n]*)?\r\n")
 
 
 class EgressProxy:
@@ -280,6 +286,8 @@ class EgressProxy:
         self._sigv4_by_host: dict[str, AwsSigV4RewriteRule] = {
             rule.host.lower(): rule for rule in aws_sigv4_rewrites or []
         }
+        if self._sigv4_by_host:
+            aws_sigv4.ensure_botocore()  # fail at startup, not on the first request
         # Precompute the expected header bytes ONCE so the per-request
         # comparison is a constant-time memcmp instead of repeating
         # the base64 round-trip on every connection. Stored as bytes
@@ -665,10 +673,11 @@ class EgressProxy:
                     )
                     return
 
-                body = await asyncio.wait_for(
-                    self._read_body(tls_reader, self._parse_header_dict(inner_headers_raw)),
-                    timeout=30,
+                body = await self._read_request_body(
+                    tls_reader, tls_writer, self._parse_header_dict(inner_headers_raw)
                 )
+                if body is None:
+                    return
 
                 keep_alive = await self._forward_https(
                     tls_writer,
@@ -801,6 +810,17 @@ class EgressProxy:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(upstream_writer.wait_closed(), timeout=2)
 
+    async def _read_request_body(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, headers: dict[str, str]
+    ) -> bytes | None:
+        """Read the body; on malformed/oversized framing reply 403 and return ``None``."""
+        try:
+            return await asyncio.wait_for(self._read_body(reader, headers), timeout=30)
+        except (ValueError, asyncio.IncompleteReadError) as exc:
+            logger.warning("REJECT-BODY %s", exc)
+            await self._send_forbidden(writer, "malformed or oversized request body")
+            return None
+
     @staticmethod
     async def _read_body(reader: asyncio.StreamReader, headers: dict[str, str]) -> bytes:
         """
@@ -808,26 +828,46 @@ class EgressProxy:
 
         ``Transfer-Encoding: chunked`` bodies (boto3's default HTTPS upload
         shape) are returned with their chunk framing intact, since the
-        forwarded headers still declare it.
+        forwarded headers still declare it. Framing is parsed strictly so
+        the proxy and upstream agree on where the body ends.
 
         :param reader: Stream positioned just after the header block.
         :param headers: Lower-cased request header dict.
         :returns: The raw body bytes, ``b""`` when the request has none.
+        :raises ValueError: On ambiguous, malformed or oversized framing.
+        :raises asyncio.IncompleteReadError: If the stream ends mid-body.
         """
-        if "chunked" in headers.get("transfer-encoding", "").lower():
-            raw = b""
-            while True:
-                size_line = await reader.readline()
-                raw += size_line
-                size = int(size_line.split(b";")[0].strip() or b"0", 16)
-                if size == 0:
-                    break
-                raw += await reader.readexactly(size + 2)
-            while (line := await reader.readline()) not in (b"\r\n", b"\n", b""):
-                raw += line  # trailers
-            return raw + b"\r\n"
-        content_length = int(headers.get("content-length", "0"))
-        return await reader.readexactly(content_length) if content_length > 0 else b""
+        transfer_encoding = headers.get("transfer-encoding")
+        if transfer_encoding is None:
+            length = int(headers.get("content-length", "0"))
+            if not 0 <= length <= _MAX_BODY_BYTES:
+                raise ValueError("invalid Content-Length")
+            return await reader.readexactly(length) if length else b""
+        if "content-length" in headers:
+            raise ValueError("both Transfer-Encoding and Content-Length")
+        if transfer_encoding.split(",")[-1].strip().lower() != "chunked":
+            raise ValueError("unsupported Transfer-Encoding")
+        raw = b""
+        while True:
+            size_line = await reader.readline()
+            match = _CHUNK_SIZE_LINE.fullmatch(size_line)
+            if match is None:
+                raise ValueError("malformed chunk size")
+            size = int(match[1], 16)
+            raw += size_line
+            if size == 0:
+                break
+            if len(raw) + size > _MAX_BODY_BYTES:
+                raise ValueError("request body too large")
+            chunk = await reader.readexactly(size + 2)
+            if not chunk.endswith(b"\r\n"):
+                raise ValueError("malformed chunk")
+            raw += chunk
+        while (line := await reader.readline()) != b"\r\n":  # trailers
+            if not line.endswith(b"\r\n") or len(raw) > _MAX_BODY_BYTES:
+                raise ValueError("malformed chunk trailer")
+            raw += line
+        return raw + b"\r\n"
 
     async def _forward_https(
         self,
@@ -1033,7 +1073,9 @@ class EgressProxy:
             return
 
         inner_headers = self._parse_header_dict(headers_raw)
-        body = await asyncio.wait_for(self._read_body(reader, inner_headers), timeout=30)
+        body = await self._read_request_body(reader, writer, inner_headers)
+        if body is None:
+            return
 
         relative_line = f"{method} {path} HTTP/1.1\r\n".encode("latin-1")
         rewrite = await self._rewrite_authorization_async(
@@ -1564,8 +1606,9 @@ class EgressProxy:
         if existing is None or not aws_sigv4.is_sigv4_authorization(existing):
             return _AuthRewriteResult(headers=headers_raw, error=None)
         # botocore signs the Host header over the URL host; refuse a sandbox-chosen authority.
+        bound = host.lower()
         if any(
-            urlsplit(f"//{value.strip()}").hostname != host.lower()
+            re.sub(r":\d+$", "", value.strip().lower()) not in (bound, f"[{bound}]")
             for value in msg.get_all("Host", [])
         ):
             return _AuthRewriteResult(
@@ -1590,6 +1633,9 @@ class EgressProxy:
             )
         except aws_sigv4.UnsupportedAwsSigV4RequestError as exc:
             return _AuthRewriteResult(headers=headers_raw, error=str(exc))
+        except Exception:
+            logger.exception("SIGV4-SIGN-FAILED %s %s", method, host)
+            return _AuthRewriteResult(headers=b"", error="SigV4 signing failed", status_code=502)
         return _AuthRewriteResult(headers=resigned.as_bytes(policy=email.policy.HTTP), error=None)
 
     @staticmethod

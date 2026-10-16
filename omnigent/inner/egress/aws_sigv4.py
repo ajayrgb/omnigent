@@ -8,7 +8,7 @@ mode it's in — is never touched: see :func:`resign_request` for why.
 
 Wraps :mod:`botocore.auth` as the actual signing crypto rather than
 hand-rolling the HMAC canonical-request algorithm. ``botocore`` is a lazy
-import (:func:`_ensure_botocore`), gated behind the ``s3`` extra, matching
+import (:func:`ensure_botocore`), gated behind the ``s3`` extra, matching
 :mod:`omnigent.stores.artifact_store.s3`'s ``_ensure_boto3`` convention —
 importing this module never requires ``botocore`` unless
 :func:`resign_request` is actually called.
@@ -64,7 +64,7 @@ def has_presigned_query_auth(query: str) -> bool:
     return "X-Amz-Signature=" in query
 
 
-def _ensure_botocore() -> None:
+def ensure_botocore() -> None:
     """
     Verify that ``botocore`` is installed.
 
@@ -146,7 +146,7 @@ def resign_request(
             "produces) can be resigned"
         )
 
-    _ensure_botocore()
+    ensure_botocore()
     from botocore.auth import S3SigV4Auth, SigV4Auth
     from botocore.awsrequest import AWSRequest
     from botocore.credentials import Credentials

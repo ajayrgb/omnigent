@@ -473,13 +473,30 @@ request):
   missing header, only replaces an existing SigV4 one.
 - Otherwise calls `omnigent.inner.egress.aws_sigv4.resign_request` — which
   discards `Authorization` / `X-Amz-Date` / `Date` / `X-Amz-Security-Token`
-  unconditionally, rebuilds them via `botocore.auth.S3SigV4Auth` (with one
+  unconditionally, rebuilds them via `botocore.auth.S3SigV4Auth` for
+  `service: s3` (ordinary `SigV4Auth` for any other service), with one
   override — see the module docstring — so `X-Amz-Content-Sha256` is never
   recomputed from the forwarded body, since that value depends only on
   body content and is already correct however it was set), and leaves
-  every other header (and the body, in whatever framing) untouched. Raises
-  `UnsupportedAwsSigV4RequestError` (→ 403) only for presigned
-  query-string auth.
+  every other header (and the body, in whatever framing) untouched. Repeated
+  headers are signed as the comma-joined value that is forwarded.
+
+Failure handling and request checks around the resign:
+
+- A `Host` header that doesn't match the credential-bound host is rejected
+  (403) before any credentials are resolved or signing happens.
+- Presigned query-string auth (`UnsupportedAwsSigV4RequestError`) → 403.
+- A credential-provider failure (STS error, expired SSO) or any other signing
+  failure → 502 with a fixed, sanitized body; details are only logged.
+- Hop-by-hop normalization (`Connection: close`) runs before signing so the
+  signed headers match the forwarded ones.
+- Request bodies are read with strict framing (`EgressProxy._read_body`):
+  `Transfer-Encoding: chunked` (boto3's default HTTPS upload) is forwarded
+  with its chunk framing intact; malformed or ambiguous framing
+  (bad chunk size, `Transfer-Encoding` with `Content-Length`) or a body over
+  256 MiB → 403, never a torn connection. The whole body is buffered.
+- `botocore` availability is checked when the proxy starts, not on the
+  first request.
 
 `botocore` is a lazy import inside `resign_request`, gated behind the `s3`
 extra (`pip install omnigent[s3]`) — importing `aws_sigv4.py` (and thus
