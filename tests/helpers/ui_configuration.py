@@ -15,6 +15,8 @@ from tests.helpers.ui_url_safety import DEV_PORTS, unsafe_ui_base_url_reason
 _ALLOW_DEV_BASE_URL_ENV = "OMNIGENT_E2E_ALLOW_DEV_BASE_URL"
 _CLAUDE_MOCK_MODEL = "claude-sonnet-4-20250514"
 _CODEX_MOCK_MODEL = "gpt-4o"
+# USD per million tokens (input, output, cache read) for the mock codex provider.
+_CODEX_MOCK_PRICING_PER_MILLION = (2.5, 10.0, 0.25)
 
 
 class ServerState(dict[str, object]):
@@ -78,6 +80,24 @@ def _validate_ui_base_url(base_url: str) -> None:
     )
 
 
+def validate_native_claude_mock_routing(mock_llm_server_url: str) -> None:
+    """Reject a known machine policy redirect before launching the real Claude CLI.
+
+    Callers must opt in to the ``claude_managed_settings`` fixture so pytest's
+    ambient isolation does not hide settings the child process will still read.
+    """
+    from omnigent.onboarding.ambient import claude_managed_gateway
+
+    managed_url, _ = claude_managed_gateway()
+    if managed_url and managed_url.rstrip("/") != mock_llm_server_url.rstrip("/"):
+        raise RuntimeError(
+            "Claude Code's managed ANTHROPIC_BASE_URL overrides the mock provider. "
+            "CLAUDE_CONFIG_DIR does not isolate machine-managed settings. "
+            "Run this mock journey in a clean container or CI runner without that override; "
+            "do not change machine policy. No Claude session was launched."
+        )
+
+
 @contextlib.contextmanager
 def temp_omnigent_mock_config(
     mock_llm_server_url: str, harness: str, *, workflow_owned: bool = False
@@ -124,6 +144,8 @@ def temp_omnigent_mock_config(
                     default: {_CLAUDE_MOCK_MODEL}
             """)
     else:  # codex
+        # The mock model is not in the pricing catalog; configured rates let
+        # the server price codex-native sessions (Session cost, per-model cost).
         mock_config = textwrap.dedent(f"""\
             providers:
               mock-codex:
@@ -135,6 +157,10 @@ def temp_omnigent_mock_config(
                   wire_api: responses
                   models:
                     default: {_CODEX_MOCK_MODEL}
+                  pricing:
+                    input_per_million: {_CODEX_MOCK_PRICING_PER_MILLION[0]}
+                    output_per_million: {_CODEX_MOCK_PRICING_PER_MILLION[1]}
+                    cache_read_per_million: {_CODEX_MOCK_PRICING_PER_MILLION[2]}
             """)
 
     if original is not None:

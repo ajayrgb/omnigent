@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
-import { CommandIcon, LoaderCircleIcon, WandSparklesIcon } from "lucide-react";
+import { CommandIcon, LoaderCircleIcon, PlugIcon, WandSparklesIcon } from "lucide-react";
 import type { SkillsStatus } from "@/lib/types";
+import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 
 /**
@@ -19,6 +20,8 @@ export const BUILTIN_SLASH_COMMANDS: Record<string, string> = {
   "/context": "Show context window usage for this session",
   "/effort": "Set reasoning effort: /effort low | medium | high | default",
   "/model": "Switch the model for this session: /model <name>",
+  "/mcp": "Show MCP servers enabled for this session",
+  "/new": "Start a blank session in the same project",
   "/btw": "Ask a side question — answered in a dismissable overlay, not saved to the conversation",
   "/side":
     "Start a side chat: an ephemeral fork opened as its own sub-agent chat, kept out of this conversation",
@@ -26,7 +29,6 @@ export const BUILTIN_SLASH_COMMANDS: Record<string, string> = {
 };
 
 const DEFAULT_BUILTIN_NAMES = new Set(Object.keys(BUILTIN_SLASH_COMMANDS));
-
 // First token must read as a command name (`/cross-review`,
 // `/dev-productivity:simplify`) — letters/digits then word chars, `:`, `-`.
 // The leading `/` is the only slash allowed IN THE NAME, so file paths like
@@ -35,34 +37,85 @@ const DEFAULT_BUILTIN_NAMES = new Set(Object.keys(BUILTIN_SLASH_COMMANDS));
 const SLASH_COMMAND_RE = /^\/[A-Za-z0-9][\w:-]*(\s|$)/;
 
 /**
- * True when a user message is a slash-command invocation typed in the
- * composer. The single command-shape definition shared by the in-session
- * composer's submit routing + highlight overlay and the landing
- * composer's skill matching — one guard, so the surfaces can't diverge
- * on what "reads as a command".
+ * True when a user message reads as a slash-command invocation by shape: the
+ * single guard shared by the composer's submit routing and highlight overlay.
  */
 export function isSlashCommandText(text: string): boolean {
   return SLASH_COMMAND_RE.test(text.trim());
 }
 
 /**
- * True when `query` is a case-insensitive substring of the command name
- * (sans the leading `/`). Matches on the name only — not the description —
- * because the web menu never shows descriptions inline, so a
- * description-driven match would look unexplained. `name` is expected to
- * carry the leading `/` (the leading char is dropped before matching).
+ * The known command or skill `text` invokes, split from its arguments, or null.
+ * Skill names may contain spaces, so the longest key in `commands` (prefix and
+ * exact case included) that prefixes the text at a word boundary wins.
  */
-export function slashCommandMatches(name: string, query: string): boolean {
-  return name.slice(1).toLowerCase().includes(query.toLowerCase());
+export function matchSlashCommandInvocation(
+  text: string,
+  commands: Iterable<string>,
+): { command: string; args: string } | null {
+  const trimmed = text.trim();
+  let command: string | null = null;
+  for (const candidate of commands) {
+    if (command !== null && candidate.length <= command.length) continue;
+    if (!trimmed.startsWith(candidate)) continue;
+    const rest = trimmed.slice(candidate.length);
+    if (rest === "" || /^\s/.test(rest)) command = candidate;
+  }
+  if (command === null) return null;
+  return { command, args: trimmed.slice(command.length).trim() };
+}
+
+/**
+ * True when `query` is a case-insensitive substring of the command name
+ * (sans the leading `/`) or of the skill's display `label`. Never matches
+ * the description, so a match is always explained by the row's name or
+ * label. `name` is expected to carry the leading `/`.
+ */
+export function slashCommandMatches(name: string, query: string, label?: string): boolean {
+  const q = query.toLowerCase();
+  return name.slice(1).toLowerCase().includes(q) || Boolean(label?.toLowerCase().includes(q));
+}
+
+/**
+ * Display names keyed by prefixed command, for skills whose label differs
+ * from the command, e.g. `{"/asd-ste100": "Simplified Technical English"}`.
+ */
+export function skillDisplayNames(
+  skills: readonly { name: string; display_name?: string | null }[],
+  prefix: string,
+): Record<string, string> {
+  return Object.fromEntries(
+    skills.flatMap((skill) => {
+      const label = skill.display_name?.trim();
+      return label && label !== skill.name ? [[`${prefix}${skill.name}`, label]] : [];
+    }),
+  );
+}
+
+/**
+ * Inline menu text for a skill: its frontmatter display name, when that
+ * differs from the typed command, ahead of the description. A skill in
+ * `asd-ste100/` named "Simplified Technical English (ASD-STE100)" is typed
+ * as `/asd-ste100` but labelled with its display name.
+ */
+export function skillMenuDescription(skill: {
+  name: string;
+  description: string;
+  display_name?: string | null;
+}): string {
+  const label = skill.display_name?.trim();
+  if (!label || label === skill.name) return skill.description;
+  return skill.description ? `${label} — ${skill.description}` : label;
 }
 
 /**
  * Filter `commands` to those matching `query`, then rank them for display:
  * built-in commands before skills (so the "Commands" section stays above
  * "Skills" and the flat keyboard index walks the same order that's
- * rendered), and within each group, prefix matches before mid-string
- * matches. The sort is stable, so commands that tie keep their insertion
- * order. Returns the ranked, slash-prefixed names.
+ * rendered), and within each group, name-prefix matches before mid-string
+ * matches, then matches on only the display `labels`. The sort is stable, so
+ * commands that tie keep their insertion order. Returns the ranked,
+ * slash-prefixed names.
  *
  * Prefix-priority matters because the first match is auto-highlighted and
  * Tab completes it and Enter can execute no-arg built-ins. Without
@@ -77,17 +130,25 @@ export function rankedSlashCommandNames(
   commands: Record<string, string>,
   query: string,
   builtinNames: ReadonlySet<string> = DEFAULT_BUILTIN_NAMES,
+  labels: Readonly<Record<string, string>> = {},
 ): string[] {
   const q = query.toLowerCase();
-  // Built-ins rank before skills; prefix matches rank before substring matches.
+  // Built-ins rank before skills; within each, name prefix, then name
+  // substring, then label-only matches, so Tab never prefers a label hit.
   const rank = (name: string): number => {
-    const group = builtinNames.has(name) ? 0 : 2;
-    const prefix = name.slice(1).toLowerCase().startsWith(q) ? 0 : 1;
-    return group + prefix;
+    const group = builtinNames.has(name) ? 0 : 3;
+    const body = name.slice(1).toLowerCase();
+    return group + (body.startsWith(q) ? 0 : body.includes(q) ? 1 : 2);
   };
   return Object.keys(commands)
-    .filter((name) => slashCommandMatches(name, query))
+    .filter((name) => slashCommandMatches(name, query, labels[name]))
     .sort((a, b) => rank(a) - rank(b));
+}
+
+/** One row of the read-only `/mcp` inventory. */
+interface McpServerRow {
+  name: string;
+  description?: string | null;
 }
 
 interface SlashCommandMenuProps {
@@ -106,11 +167,89 @@ interface SlashCommandMenuProps {
    */
   commands: Record<string, string>;
   builtinNames?: ReadonlySet<string>;
+  /** Skill display names by prefixed command; matched alongside the name. */
+  labels?: Readonly<Record<string, string>>;
   /** Absent for menus without asynchronous skill discovery. */
   skillsStatus?: SkillsStatus | null;
   /** Context-specific guidance when discovery cannot run yet. */
   skillsUnavailableMessage?: string;
   onRetrySkills?: () => void;
+  /** Replace suggestions with the read-only MCP inventory for an exact `/mcp`. */
+  showMcpServers?: boolean;
+  /** Effective MCP servers: agent-declared plus host-native for the active harness. */
+  mcpServers?: readonly McpServerRow[];
+  mcpServersStatus?: string;
+  mcpSettingsHref?: string;
+}
+
+function McpServerRows({
+  servers,
+  status,
+}: {
+  servers?: readonly McpServerRow[];
+  status?: string;
+}) {
+  if (!servers?.length && !status) {
+    return (
+      <div role="status" className="px-2 py-2 text-ui text-muted-foreground">
+        No MCP servers enabled for this session.
+      </div>
+    );
+  }
+  return (
+    <>
+      {servers?.map((server) => (
+        <div key={server.name} className="flex items-start gap-2 rounded-md px-2 py-1.5">
+          <PlugIcon aria-hidden="true" className="mt-0.5 size-3.5 shrink-0 text-emerald-500" />
+          <div className="min-w-0">
+            <div className="text-ui text-foreground">{server.name}</div>
+            {server.description && (
+              <div className="truncate text-xs leading-4 text-muted-foreground">
+                {server.description}
+              </div>
+            )}
+          </div>
+        </div>
+      ))}
+      {status && (
+        <div role="status" className="px-2 py-2 text-ui text-muted-foreground">
+          {status}
+        </div>
+      )}
+    </>
+  );
+}
+
+function McpServerMenu({
+  servers,
+  status,
+  settingsHref = "/settings/harnesses",
+}: {
+  servers?: readonly McpServerRow[];
+  status?: string;
+  settingsHref?: string;
+}) {
+  return (
+    <div
+      data-testid="mcp-server-menu"
+      onMouseDown={(event) => event.preventDefault()}
+      className="absolute bottom-full left-0 z-10 mb-2 w-[28rem] max-w-[calc(100vw-24px)] overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu dark:backdrop-blur-xl dark:backdrop-saturate-150"
+    >
+      <div className="px-2 py-1">
+        <div className="font-medium text-ui text-foreground">MCP servers</div>
+        <div className="text-xs leading-4 text-muted-foreground">Enabled for this session</div>
+      </div>
+      <div className="max-h-64 overflow-y-auto">
+        <McpServerRows servers={servers} status={status} />
+      </div>
+      <div className="mt-1 border-border border-t px-2 pt-2 text-xs text-muted-foreground">
+        <Link className="underline hover:text-foreground" to={settingsHref}>
+          Go to Settings
+        </Link>{" "}
+        to configure MCP servers.
+      </div>
+    </div>
+  );
 }
 
 /** One filtered menu row, carrying its index in the flat match order. */
@@ -191,11 +330,16 @@ export function SlashCommandMenu({
   onSelect,
   commands,
   builtinNames = DEFAULT_BUILTIN_NAMES,
+  labels,
   skillsStatus,
   skillsUnavailableMessage = "Skills unavailable while disconnected.",
   onRetrySkills,
+  showMcpServers = false,
+  mcpServers,
+  mcpServersStatus,
+  mcpSettingsHref,
 }: SlashCommandMenuProps) {
-  const matchedNames = rankedSlashCommandNames(commands, query, builtinNames);
+  const matchedNames = rankedSlashCommandNames(commands, query, builtinNames, labels);
   const listRef = useRef<HTMLDivElement>(null);
   // Keep the keyboard-highlighted row visible as the user arrows past the
   // visible window of this capped-height, scrollable list. Without this the
@@ -205,6 +349,14 @@ export function SlashCommandMenu({
     if (activeIndex < 0 || !listRef.current) return;
     listRef.current.querySelector('[data-active="true"]')?.scrollIntoView({ block: "nearest" });
   }, [activeIndex]);
+  if (showMcpServers)
+    return (
+      <McpServerMenu
+        servers={mcpServers}
+        status={mcpServersStatus}
+        settingsHref={mcpSettingsHref}
+      />
+    );
   if (matchedNames.length === 0 && skillsStatus == null) return null;
 
   // The flat match order (from rankedSlashCommandNames) drives the caller's
@@ -228,8 +380,11 @@ export function SlashCommandMenu({
   // with section headers and icon + name + inline description rows. No separate
   // detail card — each row is self-describing.
   return (
-    <div className="absolute bottom-full left-0 z-10 mb-2 w-[28rem] max-w-[calc(100vw-24px)] overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu">
-      <div ref={listRef} className="max-h-80 overflow-y-auto">
+    <div
+      data-testid="slash-command-menu"
+      className="absolute bottom-full left-0 z-10 mb-2 w-[28rem] max-w-[calc(100vw-24px)] overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu dark:backdrop-blur-xl dark:backdrop-saturate-150"
+    >
+      <div ref={listRef} className="max-h-[22rem] overflow-y-auto">
         {builtinRows.length > 0 && sectionHeader("Commands")}
         {builtinRows.map((row) => (
           <MenuRowButton
